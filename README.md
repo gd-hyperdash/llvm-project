@@ -4,7 +4,7 @@ This is a fork of LLVM which contains various extensions for the ML framework, a
 
 ## Building
 
-[CMake](https://cmake.org/), [Ninja](https://ninja-build.org/) and [LLVM](https://llvm.org/) are required.
+[CMake](https://cmake.org/), [Ninja](https://ninja-build.org/) and [LLVM](https://llvm.org/) are required. On windows, [Visual Studio 2022](https://visualstudio.microsoft.com/) is required.
 
 ### Windows
 
