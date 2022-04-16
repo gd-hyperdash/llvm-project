@@ -11599,4 +11599,40 @@ def err_hlsl_operator_unsupported : Error<
 // Layout randomization warning.
 def err_cast_from_randomized_struct : Error<
   "casting from randomized structure pointer type %0 to %1">;
+
+// Link name.
+def err_invalid_link_name : Error<
+  "invalid link name">;
+
+// Dynamic linkage.
+def err_dynamic_method : Error<
+  "methods cannot be marked as dynamic">;
+def note_dynamic_mark_record : Note<
+  "mark the %{class|struct|union} as dynamic">;
+def err_dynamic_main : Error<
+  "program entrypoint cannot be marked as dynamic">;
+
+// Hooks.
+def err_hook_already_marked : Error<
+  "function already marked as hook">;
+def err_hook_main : Error<
+  "program entrypoint cannot be marked as hook">;
+def err_hook_argument_not_valid : Error<
+  "could not find a valid base for this hook">;
+def err_hook_argument_type_mismatch : Error<
+  "the type of '%0' is not compatible with the hook">;
+def err_hook_argument_is_hook : Error<
+  "base function cannot be a hook">;
+def err_hook_argument_is_dependant : Error<
+  "base function type cannot be dependant">;
+def err_hook_call : Error<
+  "hooks cannot be called directly">;
+
+// Record extension.
+def err_extension_initialization : Error<
+  "extensions cannot be constructed directly">;
+def err_extension_argument_is_dependant : Error<
+  "extension base type cannot be dependant">;
+def err_extension_failed : Error<
+  "could not instantiate extension">;
 } // end of sema component.

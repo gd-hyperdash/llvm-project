@@ -3981,4 +3981,36 @@ def NoRandomizeLayout : InheritableAttr {
   let Documentation = [ClangRandomizeLayoutDocs];
   let LangOpts = [COnly];
 }
+
 def : MutualExclusions<[RandomizeLayout, NoRandomizeLayout]>;
+
+def LinkName : InheritableAttr {
+  let Spellings = [GNU<"link_name">, Declspec<"link_name">,
+                  CXX11<"", "link_name", 201703>, C2x<"", "link_name", 201904>];
+  let Args = [StringArgument<"Symbol">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def DynamicLinkage : InheritableAttr {
+  let Spellings = [Keyword<"dynamic">];
+  let Subjects = SubjectList<[Function, CXXRecord], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def Hook : InheritableAttr {
+  let Spellings = [GNU<"hook">, Declspec<"hook">,
+                  CXX11<"", "hook", 201703>, C2x<"", "hook", 201904>];
+  let Args = [DeclArgument<Function, "Base">, BoolArgument<"Lock", 1>];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def RecordExtension : InheritableAttr {
+  let Spellings = [Keyword<"extends">];
+  let Args = [TypeArgument<"Base">];
+  let Subjects = SubjectList<[CXXRecord], ErrorDiag>;
+  let Documentation = [Undocumented];
+  let AdditionalMembers = [{
+    void setBaseLoc(TypeSourceInfo *TSI) { base = TSI; }
+  }];

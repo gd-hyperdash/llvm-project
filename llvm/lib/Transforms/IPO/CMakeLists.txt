@@ -10,6 +10,7 @@ add_llvm_component_library(LLVMipo
   ConstantMerge.cpp
   CrossDSOCFI.cpp
   DeadArgumentElimination.cpp
+  DynamicLinkage.cpp
   ElimAvailExtern.cpp
   ExtractGV.cpp
   ForceFunctionAttrs.cpp
@@ -19,6 +20,7 @@ add_llvm_component_library(LLVMipo
   GlobalDCE.cpp
   GlobalOpt.cpp
   GlobalSplit.cpp
+  Hooks.cpp
   HotColdSplitting.cpp
   IPO.cpp
   IROutliner.cpp
