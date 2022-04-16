@@ -1062,6 +1062,7 @@ bool Parser::isStartOfFunctionDefinition(const ParsingDeclarator &Declarator) {
 Parser::DeclGroupPtrTy Parser::ParseDeclOrFunctionDefInternal(
     ParsedAttributes &Attrs, ParsingDeclSpec &DS, AccessSpecifier AS) {
   MaybeParseMicrosoftAttributes(DS.getAttributes());
+  MaybeParseMLDynamicAttribute(DS.getAttributes());
   // Parse the common declaration-specifiers piece.
   ParseDeclarationSpecifiers(DS, ParsedTemplateInfo(), AS,
                              DeclSpecContext::DSC_top_level);

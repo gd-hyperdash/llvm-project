@@ -2892,6 +2892,12 @@ private:
                                SourceLocation *endLoc = nullptr);
   ExprResult ParseExtIntegerArgument();
 
+  bool IsMaybeMLDynamicRecordAttribute();
+  void MaybeParseMLDynamicAttribute(ParsedAttributes &Attributes);
+  void MaybeExtractMLDynamicAttribute(ParsedAttributes &From,
+                                      ParsedAttributes &To);
+  void MaybeParseMLExtendsAttribute(ParsedAttributes &Attributes);
+
   VirtSpecifiers::Specifier isCXX11VirtSpecifier(const Token &Tok) const;
   VirtSpecifiers::Specifier isCXX11VirtSpecifier() const {
     return isCXX11VirtSpecifier(Tok);

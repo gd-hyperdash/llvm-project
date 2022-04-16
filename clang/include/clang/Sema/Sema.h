@@ -51,6 +51,7 @@
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/ExternalSemaSource.h"
 #include "clang/Sema/IdentifierResolver.h"
+#include "clang/Sema/ML.h"
 #include "clang/Sema/ObjCMethodList.h"
 #include "clang/Sema/Ownership.h"
 #include "clang/Sema/Scope.h"
@@ -1582,6 +1583,8 @@ private:
   bool WarnedDarwinSDKInfoMissing = false;
 
 public:
+  SemaML ML;
+
   Sema(Preprocessor &pp, ASTContext &ctxt, ASTConsumer &consumer,
        TranslationUnitKind TUKind = TU_Complete,
        CodeCompleteConsumer *CompletionConsumer = nullptr);

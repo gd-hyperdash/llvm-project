@@ -2,38 +2,31 @@
 
 This is a fork of LLVM which contains various extensions for the ML framework, all of which are licensed under [GLGPL 2.1](ML_LICENSE.txt). ML related sources are explicitly marked.
 
-## Development
+## Building
 
-[CMake](https://cmake.org/), [Ninja](https://ninja-build.org/) and [LLVM](https://llvm.org/) are required. On Windows, [Visual Studio 2022](https://visualstudio.microsoft.com/) is required.
+[CMake](https://cmake.org/), [Ninja](https://ninja-build.org/) and [LLVM](https://llvm.org/) are required.
 
 ### Windows
 
-From the Visual Studio Developer Command Prompt:
+From the X64 Native Tools VS Command Prompt:
 
 ```
-mkdir LLVMDebug
-cd LLVMDebug
-cmake -DCMAKE_CXX_FLAGS="-fuse-ld=lld-link" -DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD=X86 -GNinja -Wno-dev ..\llvm-project\llvm
+set CC=clang-cl
+set CXX=clang-cl
+mkdir Build
+cd Build
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-fuse-ld=lld-link" -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64" -GNinja -Wno-dev ..\llvm
 ninja clang
+ninja lld
+ninja llvm-ar
+ninja llvm-ranlib
+ninja llvm-strip
 ```
 
-A dummy Visual Studio project is recommended for file editing:
+For development use the following cmake command:
 
 ```
-mkdir LLVMVS
-cd LLVMVS
-cmake -DLLVM_ENABLE_PROJECTS=clang -G "Visual Studio 17 2022" -A x64 -Thost=x64 ..\llvm-project\llvm
-```
-
-## Release
-
-To build a release version of the tooling use the following command:
-
-```
-mkdir LLVMRelease
-cd LLVMRelease
-cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64" -GNinja -Wno-dev ..\llvm
-ninja clang
+cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fuse-ld=lld-link" -DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD=X86 -GNinja -Wno-dev ..\llvm-project\llvm
 ```
 
 ## Contributing

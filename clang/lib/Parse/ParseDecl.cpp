@@ -3069,6 +3069,36 @@ static void SetupFixedPointError(const LangOptions &LangOpts,
   isInvalid = true;
 }
 
+bool Parser::IsMaybeMLDynamicRecordAttribute() {
+  auto &Next = NextToken();
+  return Next.is(tok::kw_class) ||
+         (getLangOpts().CPlusPlus &&
+          Next.isOneOf(tok::kw_struct, tok::kw_union));
+}
+
+void Parser::MaybeParseMLDynamicAttribute(ParsedAttributes &Attributes) {
+  auto AttrName = Tok.getIdentifierInfo();
+  if (AttrName == &PP.getIdentifierTable().get("dynamic")) {
+    auto AttrLoc = ConsumeToken();
+    Attributes.addNew(AttrName, AttrLoc, nullptr, AttrLoc, nullptr, 0,
+                      ParsedAttr::AS_Keyword);
+  }
+}
+
+void Parser::MaybeExtractMLDynamicAttribute(ParsedAttributes &From,
+                                            ParsedAttributes &To) {
+  if (To.hasAttribute(ParsedAttr::AT_DynamicLinkage))
+    return;
+
+  for (auto &Attr : From) {
+    if (Attr.getKind() == ParsedAttr::AT_DynamicLinkage) {
+      From.remove(&Attr);
+      To.addAtEnd(&Attr);
+      break;
+    }
+  }
+}
+
 /// ParseDeclarationSpecifiers
 ///       declaration-specifiers: [C99 6.7]
 ///         storage-class-specifier declaration-specifiers[opt]
@@ -3157,6 +3187,10 @@ void Parser::ParseDeclarationSpecifiers(DeclSpec &DS,
     bool IsTemplateSpecOrInst =
         (TemplateInfo.Kind == ParsedTemplateInfo::ExplicitInstantiation ||
          TemplateInfo.Kind == ParsedTemplateInfo::ExplicitSpecialization);
+
+    // Handle dynamic records.
+    if (IsMaybeMLDynamicRecordAttribute())
+      MaybeParseMLDynamicAttribute(attrs);
 
     switch (Tok.getKind()) {
     default:
@@ -4081,6 +4115,7 @@ void Parser::ParseDeclarationSpecifiers(DeclSpec &DS,
       // To produce better diagnostic, we parse them when
       // parsing class specifier.
       ParsedAttributes Attributes(AttrFactory);
+      MaybeExtractMLDynamicAttribute(attrs, Attributes);
       ParseClassSpecifier(Kind, Loc, DS, TemplateInfo, AS,
                           EnteringContext, DSContext, Attributes);
 

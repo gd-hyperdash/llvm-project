@@ -1425,6 +1425,26 @@ bool Parser::isValidAfterTypeSpecifier(bool CouldBeBitfield) {
   return false;
 }
 
+void Parser::MaybeParseMLExtendsAttribute(ParsedAttributes &Attributes) {
+  if (!getLangOpts().CPlusPlus || Tok.isNot(tok::identifier))
+    return;
+
+  auto KWName = Tok.getIdentifierInfo();
+
+  if (KWName == &PP.getIdentifierTable().get("extends")) {
+    SourceLocation EndLoc;
+    SourceLocation KWLoc = ConsumeToken();
+
+    TypeResult Ty = ParseBaseTypeSpecifier(KWLoc, EndLoc);
+
+    if (Ty.isInvalid())
+      return;
+
+    Attributes.addNewTypeAttr(KWName, KWLoc, nullptr, KWLoc, Ty.get(),
+                              ParsedAttr::AS_Keyword);
+  }
+}
+
 /// ParseClassSpecifier - Parse a C++ class-specifier [C++ class] or
 /// elaborated-type-specifier [C++ dcl.type.elab]; we can't tell which
 /// until we reach the start of a definition or see a token that
@@ -1747,6 +1767,12 @@ void Parser::ParseClassSpecifier(tok::TokenKind TagTokKind,
   //   &T::operator struct s;
   // For these, DSC is DeclSpecContext::DSC_type_specifier or
   // DeclSpecContext::DSC_alias_declaration.
+
+  // Add dynamic attribute, if any.
+  MaybeExtractMLDynamicAttribute(Attributes, attrs);
+
+  // Parse record extension, if any.
+  MaybeParseMLExtendsAttribute(attrs);
 
   // If there are attributes after class name, parse them.
   MaybeParseCXX11Attributes(Attributes);

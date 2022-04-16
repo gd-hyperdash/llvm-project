@@ -11609,14 +11609,13 @@ def err_cast_from_randomized_struct : Error<
   "casting from randomized structure pointer type %0 to %1">;
 
 // Link name.
-def err_invalid_link_name : Error<
-  "invalid link name">;
+def err_link_name_invalid : Error<"invalid link name">;
+def err_link_name_duplicate : Error<"link name already defined">;
 
 // Dynamic linkage.
 def err_dynamic_method : Error<
   "methods cannot be marked as dynamic">;
-def note_dynamic_mark_record : Note<
-  "mark the %{class|struct|union} as dynamic">;
+def note_dynamic_mark_record : Note<"mark '%0' as dynamic">;
 def err_dynamic_main : Error<
   "program entrypoint cannot be marked as dynamic">;
 
