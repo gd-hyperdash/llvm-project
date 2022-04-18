@@ -3092,8 +3092,7 @@ void Parser::MaybeExtractMLDynamicAttribute(ParsedAttributes &From,
 
   for (auto &Attr : From) {
     if (Attr.getKind() == ParsedAttr::AT_DynamicLinkage) {
-      From.remove(&Attr);
-      To.addAtEnd(&Attr);
+      To.takeOneFrom(From, &Attr);
       break;
     }
   }
@@ -3189,8 +3188,10 @@ void Parser::ParseDeclarationSpecifiers(DeclSpec &DS,
          TemplateInfo.Kind == ParsedTemplateInfo::ExplicitSpecialization);
 
     // Handle dynamic records.
+    ParsedAttributes dynamicAttr(AttrFactory);
+
     if (IsMaybeMLDynamicRecordAttribute())
-      MaybeParseMLDynamicAttribute(attrs);
+      MaybeParseMLDynamicAttribute(dynamicAttr);
 
     switch (Tok.getKind()) {
     default:
@@ -4115,7 +4116,7 @@ void Parser::ParseDeclarationSpecifiers(DeclSpec &DS,
       // To produce better diagnostic, we parse them when
       // parsing class specifier.
       ParsedAttributes Attributes(AttrFactory);
-      MaybeExtractMLDynamicAttribute(attrs, Attributes);
+      MaybeExtractMLDynamicAttribute(dynamicAttr, Attributes);
       ParseClassSpecifier(Kind, Loc, DS, TemplateInfo, AS,
                           EnteringContext, DSContext, Attributes);
 
