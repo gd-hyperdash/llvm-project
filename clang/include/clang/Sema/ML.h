@@ -11,9 +11,11 @@
 #include "llvm/ADT/SetVector.h"
 
 namespace clang {
+class LookupResult;
 class ParsedAttr;
 
 class SemaML {
+  friend class Parser;
   friend class Sema;
 
 public:
@@ -26,15 +28,24 @@ public:
   Sema &S;
 
 protected:
+  bool HandlingHookArgs = false;
+  bool HandlingTilde = false;
+
   /// Cache for "link_name", used to prevent defining the
   /// same symbol more than once.
   llvm::SetVector<StringRef> LinkNameCache;
 
   SemaML(Sema &SemaRef) : S(SemaRef) {}
 
+  ExprResult LookupHookBaseImpl(CXXRecordDecl *Base, LookupResult &R);
+
 public:
   void cacheLinkName(StringRef S) { LinkNameCache.insert(S); }
   bool hasLinkNameCached(StringRef S) { return LinkNameCache.contains(S); }
+
+  ExprResult LookupHookMemberBase(CXXRecordDecl *Base,
+                                  const DeclarationNameInfo &DNI);
+  ExprResult LookupHookDtorBase(CXXRecordDecl *Base);
 
   HookBaseKind GetHookBaseKind(Expr *BaseExpr);
   FunctionDecl *HandleSimpleBase(FunctionDecl *H, Expr *BaseExpr);
@@ -46,12 +57,12 @@ public:
   TypeSourceInfo *AttachBaseToExtension(CXXRecordDecl *E, TypeSourceInfo *B);
 };
 
-  /// Attribute handlers.
+/// Attribute handlers.
 
-  void handleLinkNameAttr(Sema &S, Decl *D, const ParsedAttr &AL);
-  void handleDynamicLinkageAttr(Sema &S, Decl *D, const ParsedAttr &AL);
-  void handleHookAttr(Sema &S, Decl *D, const ParsedAttr &AL);
-  void handleRecordExtensionAttr(Sema &S, Decl *D, const ParsedAttr &AL);
+void handleLinkNameAttr(Sema &S, Decl *D, const ParsedAttr &AL);
+void handleDynamicLinkageAttr(Sema &S, Decl *D, const ParsedAttr &AL);
+void handleHookAttr(Sema &S, Decl *D, const ParsedAttr &AL);
+void handleRecordExtensionAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 } // namespace clang
 
 #endif // LLVM_CLANG_SEMA_ML_H

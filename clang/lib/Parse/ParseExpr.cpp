@@ -1367,10 +1367,20 @@ ExprResult Parser::ParseCastExpression(CastParseKind ParseKind,
     return Res;
   }
 
+    case tok::tilde: {
+    // Handle destructor hook.
+    if (Actions.ML.HandlingHookArgs) {
+      Actions.ML.HandlingTilde = true;
+      Tok.setKind(tok::identifier);
+      ExprResult HookBase = ParseCastExpression(AnyCastExpr);
+      Actions.ML.HandlingTilde = false;
+      return HookBase;
+    }
+  } LLVM_FALLTHROUGH;
+
   case tok::star:          // unary-expression: '*' cast-expression
   case tok::plus:          // unary-expression: '+' cast-expression
   case tok::minus:         // unary-expression: '-' cast-expression
-  case tok::tilde:         // unary-expression: '~' cast-expression
   case tok::exclaim:       // unary-expression: '!' cast-expression
   case tok::kw___real:     // unary-expression: '__real' cast-expression [GNU]
   case tok::kw___imag: {   // unary-expression: '__imag' cast-expression [GNU]

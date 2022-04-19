@@ -5,6 +5,7 @@
 //===-----------------------------------------------------------------------===//
 
 #include "clang/AST/DeclFriend.h"
+#include "clang/Sema/Lookup.h"
 #include "clang/Sema/ML.h"
 #include "clang/Sema/SemaInternal.h"
 
@@ -28,7 +29,7 @@ struct ExtImpl {
 //===-----------------------------------------------------------------------===//
 
 static auto constexpr ML_NS = "mlrt";
-static auto constexpr ML_EXT_DATA = "MLExtensionImpl";
+static auto constexpr ML_EXT_DATA = "ExtImpl";
 
 //===-----------------------------------------------------------------------===//
 // Helpers
@@ -159,9 +160,80 @@ static bool ForceCompleteFunction(Sema &S, FunctionDecl *FD) {
   return true;
 }
 
+NestedNameSpecifierLoc BuildRecordQualifier(Sema &S, RecordDecl *R,
+                                            SourceRange Range = SourceRange()) {
+  NestedNameSpecifierLocBuilder Builder;
+  auto &Context = S.Context;
+
+  auto NNS = NestedNameSpecifier::Create(Context, nullptr, false,
+                                         Context.getRecordType(R).getTypePtr());
+
+  Builder.MakeTrivial(Context, NNS, Range);
+  return Builder.getWithLocInContext(Context);
+}
+
+UnaryOperator *BuildAddrOf(Sema &S, Expr *E,
+                           SourceLocation Loc = SourceLocation()) {
+  if (E) {
+    auto UO = S.CreateBuiltinUnaryOp(Loc, UnaryOperatorKind::UO_AddrOf, E);
+    return UO.isUsable() ? cast<UnaryOperator>(UO.get()) : nullptr;
+  }
+
+  return nullptr;
+}
+
 //===-----------------------------------------------------------------------===//
-// SemaExtension
+// SemaML
 //===-----------------------------------------------------------------------===//
+
+ExprResult SemaML::LookupHookBaseImpl(CXXRecordDecl *Base,
+                                           LookupResult &R) {
+  DeclarationNameInfo DNI = R.getLookupNameInfo();
+
+  // Find all matching bases.
+  S.LookupQualifiedName(R, Base);
+
+  // Handle the lookup result.
+  auto &Unresolved = R.asUnresolvedSet();
+
+  if (Unresolved.size()) {
+    auto M = cast<CXXMethodDecl>(*Unresolved.begin());
+
+    // Build qualifier.
+    auto Q = BuildRecordQualifier(S, Base);
+
+    // Build expression.
+    if (Unresolved.size() == 1u) {
+      auto DeclRef = S.BuildDeclRefExpr(
+          M, M->getType(), ExprValueKind::VK_PRValue, M->getNameInfo(), Q);
+      return BuildAddrOf(S, DeclRef, DNI.getLoc());
+    } else {
+      auto ULE = S.CreateUnresolvedLookupExpr(Base, Q, DNI, Unresolved, false);
+
+      if (ULE.isUsable()) {
+        return BuildAddrOf(S, ULE.get(), DNI.getLoc());
+      }
+    }
+  }
+
+  return ExprError();
+}
+
+ExprResult SemaML::LookupHookMemberBase(CXXRecordDecl *Base,
+                                             const DeclarationNameInfo &DNI) {
+  LookupResult R(S, DNI, Sema::LookupNameKind::LookupMemberName);
+  return LookupHookBaseImpl(Base, R);
+}
+
+ExprResult SemaML::LookupHookDtorBase(CXXRecordDecl *Base) {
+  if (auto Dtor = Base->getDestructor()) {
+    LookupResult R(S, Dtor->getNameInfo(),
+                   Sema::LookupNameKind::LookupDestructorName);
+    return LookupHookBaseImpl(Base, R);
+  }
+
+  return ExprError();
+}
 
 SemaML::HookBaseKind SemaML::GetHookBaseKind(Expr *BaseExpr) {
   if (isa<DeclRefExpr>(BaseExpr)) {
@@ -381,9 +453,6 @@ void clang::handleLinkNameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 }
 
 void clang::handleDynamicLinkageAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
-
-    llvm::outs() << "Dynamic linkage handler invoked!\n";
-
   // Prevent dynamic methods.
   if (auto const M = dyn_cast<CXXMethodDecl>(D)) {
     S.Diag(AL.getLoc(), diag::err_dynamic_method);
@@ -410,9 +479,11 @@ void clang::handleHookAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   assert(BaseExpr && "No base?");
 
   //
-  if (auto E = AL.getArgAsExpr(1)) {
-    llvm::outs() << "Found expression for hook!\n";
-    E->dumpColor();
+  if (AL.getNumArgs() > 1) {
+    if (auto E = AL.getArgAsExpr(1)) {
+      llvm::outs() << "Found expression for hook!\n";
+      E->dumpColor();
+    }
   }
   //
 
@@ -434,9 +505,6 @@ void clang::handleHookAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 }
 
 void clang::handleRecordExtensionAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
-
-    llvm::outs() << "Record extension handler invoked!\n";
-
   TypeSourceInfo *TSI = nullptr;
   auto E = cast<CXXRecordDecl>(D);
   assert(AL.hasParsedType() && "No type?");

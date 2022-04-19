@@ -265,6 +265,11 @@ void Parser::ParseGNUAttributes(ParsedAttributes &Attrs,
   Attrs.Range = SourceRange(StartLoc, EndLoc);
 }
 
+/// Determine whether the given attribute is a hook attribute.
+static bool attributeIsHookAttr(const IdentifierInfo &II) {
+  return II.getName() == "hook";
+}
+
 /// Determine whether the given attribute has an identifier argument.
 static bool attributeHasIdentifierArg(const IdentifierInfo &II) {
 #define CLANG_ATTR_IDENTIFIER_ARG_LIST
@@ -450,10 +455,13 @@ unsigned Parser::ParseAttributeArgsCommon(
 
       CommaLocsTy CommaLocs;
       ExprVector ParsedExprs;
-      if (ParseExpressionList(ParsedExprs, CommaLocs,
-                              llvm::function_ref<void()>(),
-                              /*FailImmediatelyOnInvalidExpr=*/true,
-                              /*EarlyTypoCorrection=*/true)) {
+      Actions.ML.HandlingHookArgs = attributeIsHookAttr(*AttrName);
+      bool Result = ParseExpressionList(ParsedExprs, CommaLocs,
+                                        llvm::function_ref<void()>(),
+                                        /*FailImmediatelyOnInvalidExpr=*/true,
+                                        /*EarlyTypoCorrection=*/true);
+      Actions.ML.HandlingHookArgs = false;
+      if (Result) {
         SkipUntil(tok::r_paren, StopAtSemi);
         return 0;
       }

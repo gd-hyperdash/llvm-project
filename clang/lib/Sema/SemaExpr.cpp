@@ -2450,6 +2450,21 @@ recoverFromMSUnqualifiedLookup(Sema &S, ASTContext &Context,
       TemplateArgs);
 }
 
+static ExprResult FindHookMethod(Sema &SemaRef, Scope *S,
+                                 const DeclarationNameInfo &DNI,
+                                 bool HandlingTilde) {
+  assert(S && "No scope?");
+  if (auto RD = dyn_cast<CXXRecordDecl>(S->getEntity())) {
+    if (auto RE = RD->getAttr<RecordExtensionAttr>()) {
+      auto Base = RE->getBase()->getAsCXXRecordDecl();
+      return HandlingTilde ? SemaRef.ML.LookupHookDtorBase(Base)
+                           : SemaRef.ML.LookupHookMemberBase(Base, DNI);
+    }
+  }
+
+  return ExprError();
+}
+
 ExprResult
 Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
                         SourceLocation TemplateKWLoc, UnqualifiedId &Id,
@@ -2565,6 +2580,10 @@ Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
   bool ADL = UseArgumentDependentLookup(SS, R, HasTrailingLParen);
 
   if (R.empty() && !ADL) {
+    // Handle hook method arguments here.
+      if (ML.HandlingHookArgs)
+      return FindHookMethod(*this, S, NameInfo, ML.HandlingTilde);
+
     if (SS.isEmpty() && getLangOpts().MSVCCompat) {
       if (Expr *E = recoverFromMSUnqualifiedLookup(*this, Context, NameInfo,
                                                    TemplateKWLoc, TemplateArgs))
@@ -14255,7 +14274,7 @@ QualType Sema::CheckAddressOfOperand(ExprResult &OrigOp, SourceLocation OpLoc) {
     }
 
     // Taking the address of a dtor is illegal per C++ [class.dtor]p2.
-    if (isa<CXXDestructorDecl>(MD))
+    if (isa<CXXDestructorDecl>(MD) && !(ML.HandlingHookArgs && ML.HandlingTilde))
       Diag(OpLoc, diag::err_typecheck_addrof_dtor) << op->getSourceRange();
 
     QualType MPTy = Context.getMemberPointerType(
