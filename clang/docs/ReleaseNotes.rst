@@ -226,6 +226,7 @@ C2x Feature Support
 - Implemented `WG14 N2775 Literal suffixes for bit-precise integers <http://www.open-std.org/jtc1/sc22/wg14/www/docs/n2775.pdf>`_.
 - Implemented the `*_WIDTH` macros to complete support for
   `WG14 N2412 Two's complement sign representation for C2x <https://www9.open-std.org/jtc1/sc22/wg14/www/docs/n2412.pdf>`_.
+- Implemented `WG14 N2418 Adding the u8 character prefix <http://www.open-std.org/jtc1/sc22/wg14/www/docs/n2418.pdf>`_.
 
 C++ Language Changes in Clang
 -----------------------------
@@ -261,6 +262,8 @@ C++2b Feature Support
 - Implemented `P2036R3: Change scope of lambda trailing-return-type <https://wg21.link/P2036R3>`_.
   This proposal modifies how variables captured in lambdas can appear in trailing return type
   expressions and how their types are deduced therein, in all C++ language versions.
+  `CWG2569 <https://cplusplus.github.io/CWG/issues/2569.html>`_ is also partially implemented so that
+  `[x](decltype(x)){}` doesn't become ill-formed with the adoption of P2036R3.
 
 CUDA Language Changes in Clang
 ------------------------------

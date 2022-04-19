@@ -2698,6 +2698,18 @@ Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
   return BuildDeclarationNameExpr(SS, R, ADL);
 }
 
+ExprResult Sema::ActOnMutableAgnosticIdExpression(Scope *S, CXXScopeSpec &SS,
+                                                  UnqualifiedId &Id) {
+  MutableAgnosticContextRAII Ctx(*this);
+  return ActOnIdExpression(S, SS, /*TemplateKwLoc*/
+                           SourceLocation(), Id,
+                           /*HasTrailingLParen*/ false,
+                           /*IsAddressOfOperand*/ false,
+                           /*CorrectionCandidateCallback*/ nullptr,
+                           /*IsInlineAsmIdentifier*/ false,
+                           /*KeywordReplacement*/ nullptr);
+}
+
 /// BuildQualifiedDeclarationNameExpr - Build a C++ qualified
 /// declaration name, generally during template instantiation.
 /// There's a large number of things which don't need to be done along
@@ -3597,6 +3609,8 @@ ExprResult Sema::ActOnCharacterConstant(const Token &Tok, Scope *UDLScope) {
   QualType Ty;
   if (Literal.isWide())
     Ty = Context.WideCharTy; // L'x' -> wchar_t in C and C++.
+  else if (Literal.isUTF8() && getLangOpts().C2x)
+    Ty = Context.UnsignedCharTy; // u8'x' -> unsigned char in C2x
   else if (Literal.isUTF8() && getLangOpts().Char8)
     Ty = Context.Char8Ty; // u8'x' -> char8_t when it exists.
   else if (Literal.isUTF16())
@@ -3606,7 +3620,8 @@ ExprResult Sema::ActOnCharacterConstant(const Token &Tok, Scope *UDLScope) {
   else if (!getLangOpts().CPlusPlus || Literal.isMultiChar())
     Ty = Context.IntTy;   // 'x' -> int in C, 'wxyz' -> int in C++.
   else
-    Ty = Context.CharTy;  // 'x' -> char in C++
+    Ty = Context.CharTy; // 'x' -> char in C++;
+                         // u8'x' -> char in C11-C17 and in C++ without char8_t.
 
   CharacterLiteral::CharacterKind Kind = CharacterLiteral::Ascii;
   if (Literal.isWide())
@@ -18545,6 +18560,11 @@ static void buildLambdaCaptureFixit(Sema &Sema, LambdaScopeInfo *LSI,
 static bool CheckCaptureUseBeforeLambdaQualifiers(Sema &S, VarDecl *Var,
                                                   SourceLocation ExprLoc,
                                                   LambdaScopeInfo *LSI) {
+
+  // Allow `[a = 1](decltype(a)) {}` as per CWG2569.
+  if (S.InMutableAgnosticContext)
+    return true;
+
   if (Var->isInvalidDecl())
     return false;
 
@@ -18627,7 +18647,7 @@ bool Sema::tryCaptureVariable(
       LSI = dyn_cast_or_null<LambdaScopeInfo>(
           FunctionScopes[FunctionScopesIndex]);
     if (LSI && LSI->BeforeLambdaQualifiersScope) {
-      if (isa<ParmVarDecl>(Var))
+      if (isa<ParmVarDecl>(Var) && !Var->getDeclContext()->isFunctionOrMethod())
         return true;
       IsInLambdaBeforeQualifiers = true;
       if (!CheckCaptureUseBeforeLambdaQualifiers(*this, Var, ExprLoc, LSI)) {
