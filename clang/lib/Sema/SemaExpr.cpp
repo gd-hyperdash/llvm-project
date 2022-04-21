@@ -2581,8 +2581,12 @@ Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
 
   if (R.empty() && !ADL) {
     // Handle hook method arguments here.
-      if (ML.HandlingHookArgs)
-      return FindHookMethod(*this, S, NameInfo, ML.HandlingTilde);
+    if (ML.HandlingHookArgs) {
+      ExprResult HookBase =
+          FindHookMethod(*this, S, NameInfo, ML.HandlingTilde);
+      if (HookBase.isUsable())
+        return HookBase;
+    }
 
     if (SS.isEmpty() && getLangOpts().MSVCCompat) {
       if (Expr *E = recoverFromMSUnqualifiedLookup(*this, Context, NameInfo,
