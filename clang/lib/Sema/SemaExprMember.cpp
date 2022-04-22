@@ -892,6 +892,39 @@ BuildMSPropertyRefExpr(Sema &S, Expr *BaseExpr, bool IsArrow,
                                            NameInfo.getLoc());
 }
 
+static Expr *HandleExtensionBaseExpr(Sema &SemaRef, Expr *Base, bool IsArrow) {
+  auto E = Base->getType()->getPointeeCXXRecordDecl();
+
+  if (!E)
+    E = Base->getType()->getAsCXXRecordDecl();
+
+  if (E && E->hasAttr<RecordExtensionAttr>()) {
+    auto Self = SemaRef.ML.LookupBuiltinSelf(const_cast<CXXRecordDecl *>(E),
+                                             Base->getExprLoc(), true);
+
+    if (Self) {
+      auto AP = DeclAccessPair::make(Self, AccessSpecifier::AS_public);
+      auto Member = MemberExpr::Create(
+          SemaRef.Context, Base, IsArrow, Base->getExprLoc(),
+          NestedNameSpecifierLoc(), SourceLocation(), Self, AP,
+          Self->getNameInfo(), nullptr, SemaRef.Context.BoundMemberTy,
+          ExprValueKind::VK_PRValue, ExprObjectKind::OK_Ordinary,
+          NonOdrUseReason::NOUR_None);
+      auto Call = SemaRef.BuildCallToMemberFunction(
+          nullptr, Member, SourceLocation(), {}, SourceLocation());
+
+      if (Call.isUsable()) {
+        SemaRef.MarkMemberReferenced(Member);
+        return Call.get();
+      }
+    }
+
+    SemaRef.Diag(Base->getExprLoc(), diag::err_extension_member_access);
+  }
+
+  return nullptr;
+}
+
 MemberExpr *Sema::BuildMemberExpr(
     Expr *Base, bool IsArrow, SourceLocation OpLoc, const CXXScopeSpec *SS,
     SourceLocation TemplateKWLoc, ValueDecl *Member, DeclAccessPair FoundDecl,
@@ -913,6 +946,13 @@ MemberExpr *Sema::BuildMemberExpr(
     const TemplateArgumentListInfo *TemplateArgs) {
   assert((!IsArrow || Base->isPRValue()) &&
          "-> base must be a pointer prvalue");
+
+  Expr *NewExpr = HandleExtensionBaseExpr(*this, Base, IsArrow);
+  if (NewExpr) {
+    Base = NewExpr;
+    IsArrow = true;
+  }
+
   MemberExpr *E =
       MemberExpr::Create(Context, Base, IsArrow, OpLoc, NNS, TemplateKWLoc,
                          Member, FoundDecl, MemberNameInfo, TemplateArgs, Ty,

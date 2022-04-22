@@ -5,6 +5,7 @@
 //===-----------------------------------------------------------------------===//
 
 #include "clang/AST/DeclFriend.h"
+#include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/ML.h"
 #include "clang/Sema/SemaInternal.h"
@@ -30,6 +31,8 @@ struct ExtImpl {
 
 static auto constexpr ML_NS = "mlrt";
 static auto constexpr ML_EXT_DATA = "ExtImpl";
+static auto constexpr ML_SELF = "ml_self_impl";
+static auto constexpr ML_SELF_MUTABLE = "ml_self_mut_impl";
 
 //===-----------------------------------------------------------------------===//
 // Helpers
@@ -186,12 +189,32 @@ UnaryOperator *BuildAddrOf(Sema &S, Expr *E,
 // SemaML
 //===-----------------------------------------------------------------------===//
 
-ExprResult SemaML::LookupHookBaseImpl(CXXRecordDecl *Base,
-                                           LookupResult &R) {
+bool SemaML::isMLNamespace(const DeclContext *DC) {
+  if (!DC) {
+    return false;
+  }
+
+  if (auto ND = dyn_cast<NamespaceDecl>(DC)) {
+    if (!ND->isInline() &&
+        DC->getParent()->getRedeclContext()->isTranslationUnit()) {
+      const IdentifierInfo *II = ND->getIdentifier();
+      return II && II->isStr(ML_NS);
+    }
+  }
+
+  return isMLNamespace(DC->getParent());
+}
+
+bool SemaML::isInMLNamespace(const Decl *D) {
+  return D ? isMLNamespace(D->getDeclContext()) : false;
+}
+
+ExprResult SemaML::LookupHookBaseImpl(CXXRecordDecl *Base, LookupResult &R) {
   DeclarationNameInfo DNI = R.getLookupNameInfo();
 
   // Find all matching bases.
-  S.LookupQualifiedName(R, Base);
+  if (!S.LookupQualifiedName(R, Base))
+    return ExprError();
 
   // Handle the lookup result.
   auto &Unresolved = R.asUnresolvedSet();
@@ -219,6 +242,30 @@ ExprResult SemaML::LookupHookBaseImpl(CXXRecordDecl *Base,
   return ExprError();
 }
 
+CXXMethodDecl *SemaML::LookupBuiltinImpl(CXXRecordDecl *E,
+                                         const IdentifierInfo *II,
+                                         SourceLocation Loc) {
+  UnqualifiedId Id;
+  TemplateArgumentListInfo TemplateArgsBuffer;
+  const TemplateArgumentListInfo *TemplateArgs;
+  DeclarationNameInfo NameInfo;
+
+  // Build name info.
+  Id.setIdentifier(II, Loc);
+  S.DecomposeUnqualifiedId(Id, TemplateArgsBuffer, NameInfo, TemplateArgs);
+
+  // Perform lookup.
+  LookupResult R(S, NameInfo, Sema::LookupNameKind::LookupMemberName);
+
+  if (S.LookupQualifiedName(R, E)) {
+    auto Result = R.getAsSingle<CXXMethodDecl>();
+    if (isInMLNamespace(Result))
+      return Result;
+  }
+
+  return nullptr;
+}
+
 ExprResult SemaML::LookupHookMemberBase(CXXRecordDecl *Base,
                                              const DeclarationNameInfo &DNI) {
   LookupResult R(S, DNI, Sema::LookupNameKind::LookupMemberName);
@@ -233,6 +280,13 @@ ExprResult SemaML::LookupHookDtorBase(CXXRecordDecl *Base) {
   }
 
   return ExprError();
+}
+
+CXXMethodDecl *SemaML::LookupBuiltinSelf(CXXRecordDecl *E, SourceLocation Loc,
+                                         bool Mutable) {
+  const IdentifierInfo *II =
+      &S.PP.getIdentifierTable().get(Mutable ? ML_SELF_MUTABLE : ML_SELF);
+  return II ? LookupBuiltinImpl(E, II, Loc) : nullptr;
 }
 
 SemaML::HookBaseKind SemaML::GetHookBaseKind(Expr *BaseExpr) {
@@ -477,15 +531,6 @@ void clang::handleHookAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto FD = cast<FunctionDecl>(D);
   auto BaseExpr = AL.getArgAsExpr(0u);
   assert(BaseExpr && "No base?");
-
-  //
-  if (AL.getNumArgs() > 1) {
-    if (auto E = AL.getArgAsExpr(1)) {
-      llvm::outs() << "Found expression for hook!\n";
-      E->dumpColor();
-    }
-  }
-  //
 
   // A hook can only target one function.
   if (FD->hasAttr<HookAttr>()) {

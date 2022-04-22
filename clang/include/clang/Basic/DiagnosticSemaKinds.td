@@ -11649,6 +11649,8 @@ def err_extension_initialization : Error<
   "extensions cannot be constructed directly">;
 def err_extension_argument_is_dependant : Error<
   "extension base type cannot be dependant">;
+def err_extension_member_access : Error<
+  "could not access member">;
 def err_extension_failed : Error<
   "could not instantiate extension">;
 } // end of sema component.

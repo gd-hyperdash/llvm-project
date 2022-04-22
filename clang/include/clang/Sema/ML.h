@@ -38,14 +38,22 @@ protected:
   SemaML(Sema &SemaRef) : S(SemaRef) {}
 
   ExprResult LookupHookBaseImpl(CXXRecordDecl *Base, LookupResult &R);
+  CXXMethodDecl *LookupBuiltinImpl(CXXRecordDecl *E, const IdentifierInfo *II,
+                                   SourceLocation Loc);
 
 public:
+  bool isMLNamespace(const DeclContext *DC);
+  bool isInMLNamespace(const Decl *D);
+
   void cacheLinkName(StringRef S) { LinkNameCache.insert(S); }
   bool hasLinkNameCached(StringRef S) { return LinkNameCache.contains(S); }
 
   ExprResult LookupHookMemberBase(CXXRecordDecl *Base,
                                   const DeclarationNameInfo &DNI);
   ExprResult LookupHookDtorBase(CXXRecordDecl *Base);
+
+  CXXMethodDecl *LookupBuiltinSelf(CXXRecordDecl *E, SourceLocation Loc,
+                                   bool Mutable);
 
   HookBaseKind GetHookBaseKind(Expr *BaseExpr);
   FunctionDecl *HandleSimpleBase(FunctionDecl *H, Expr *BaseExpr);
