@@ -893,14 +893,18 @@ BuildMSPropertyRefExpr(Sema &S, Expr *BaseExpr, bool IsArrow,
 }
 
 static Expr *HandleExtensionBaseExpr(Sema &SemaRef, Expr *Base, bool IsArrow) {
-  auto E = Base->getType()->getPointeeCXXRecordDecl();
+  assert(Base && "No expr?");
+  auto Ty = Base->getType()->getPointeeType();
 
-  if (!E)
-    E = Base->getType()->getAsCXXRecordDecl();
+  if (Ty.isNull())
+    Ty = Base->getType();
+
+  auto E = Ty->getAsCXXRecordDecl();
+  bool IsMutable = !Ty.isConstQualified();
 
   if (E && E->hasAttr<RecordExtensionAttr>()) {
     auto Self = SemaRef.ML.LookupBuiltinSelf(const_cast<CXXRecordDecl *>(E),
-                                             Base->getExprLoc(), true);
+                                             Base->getExprLoc(), IsMutable);
 
     if (Self) {
       auto AP = DeclAccessPair::make(Self, AccessSpecifier::AS_public);

@@ -11635,8 +11635,18 @@ def err_hook_main : Error<
   "program entrypoint cannot be marked as hook">;
 def err_hook_argument_not_valid : Error<
   "could not find a valid base for this hook">;
-def err_hook_argument_type_mismatch : Error<
-  "the type of '%0' is not compatible with the hook">;
+def err_hook_type : Error<
+  "incorrect type, expected '%0'">;
+def err_hook_num_args : Error<
+  "incorrect number of arguments">;
+def err_hook_variadic : Error<
+  "incorrect variadic declaration">;
+def err_hook_noexcept : Error<
+  "incorrect noexcept declaration">;
+def err_hook_cc : Error<
+  "incorrect calling convention">;
+def err_hook_member_base : Error<
+  "incorrect base class, expected '%0'">;
 def err_hook_argument_is_hook : Error<
   "base function cannot be a hook">;
 def err_hook_argument_is_dependant : Error<

@@ -48,6 +48,56 @@ static Expr *UnwrapHookExpr(Expr *E) {
   return E;
 }
 
+static bool CheckHookBase(Sema &S, FunctionDecl const *H,
+                          FunctionDecl const *FD) {
+  assert(H && FD && "No func?");
+  auto HTy = H->getType()->getAs<FunctionProtoType>();
+  auto FDTy = FD->getType()->getAs<FunctionProtoType>();
+  assert(HTy && FDTy && "No type?");
+
+  if (HTy->getReturnType() != FDTy->getReturnType()) {
+    S.Diag(H->getReturnTypeSourceRange().getBegin(), diag::err_hook_type)
+        << FDTy->getReturnType().getAsString();
+    return false;
+  }
+
+  if (HTy->getNumParams() != FDTy->getNumParams()) {
+    auto Loc = HTy->getNumParams() ? H->getParametersSourceRange().getBegin()
+                                   : H->getLocation();
+    S.Diag(Loc, diag::err_hook_num_args);
+    return false;
+  }
+
+  if (HTy->isVariadic() != FDTy->isVariadic()) {
+    auto Loc = HTy->isVariadic() ? H->getEllipsisLoc() : H->getLocation();
+    S.Diag(Loc, diag::err_hook_variadic);
+    return false;
+  }
+
+  if (HTy->hasNoexceptExceptionSpec() != FDTy->hasNoexceptExceptionSpec()) {
+    auto Loc = HTy->hasNoexceptExceptionSpec()
+                   ? H->getExceptionSpecSourceRange().getBegin()
+                   : H->getLocation();
+    S.Diag(Loc, diag::err_hook_noexcept);
+    return false;
+  }
+
+  if (HTy->getCallConv() != FDTy->getCallConv()) {
+    S.Diag(H->getLocation(), diag::err_hook_cc);
+    return false;
+  }
+
+  for (auto i = 0u; i < HTy->getNumParams(); ++i) {
+    if (HTy->getParamType(i) != FDTy->getParamType(i)) {
+      S.Diag(H->getParamDecl(i)->getTypeSpecStartLoc(), diag::err_hook_type)
+          << FDTy->getParamType(i).getAsString();
+      return false;
+    }
+  }
+
+  return true;
+}
+
 static QualType GetHookType(Sema &S, FunctionDecl *H, CXXRecordDecl *Base) {
   QualType T = H->getType();
 
@@ -267,7 +317,7 @@ CXXMethodDecl *SemaML::LookupBuiltinImpl(CXXRecordDecl *E,
 }
 
 ExprResult SemaML::LookupHookMemberBase(CXXRecordDecl *Base,
-                                             const DeclarationNameInfo &DNI) {
+                                        const DeclarationNameInfo &DNI) {
   LookupResult R(S, DNI, Sema::LookupNameKind::LookupMemberName);
   return LookupHookBaseImpl(Base, R);
 }
@@ -314,14 +364,7 @@ FunctionDecl *SemaML::HandleSimpleBase(FunctionDecl *H, Expr *BaseExpr) {
     return nullptr;
   }
 
-  // TODO: checking types with strings? /srs?
-  if (H->getType().getAsString() != FD->getType().getAsString()) {
-    S.Diag(H->getLocation(), diag::err_hook_argument_type_mismatch)
-        << FD->getQualifiedNameAsString();
-    return nullptr;
-  }
-
-  return FD;
+  return CheckHookBase(S, H, FD) ? FD : nullptr;
 }
 
 FunctionDecl *SemaML::HandleLookupBase(FunctionDecl *H, Expr *BaseExpr,
@@ -404,8 +447,8 @@ FunctionDecl *SemaML::ValidateHookBase(FunctionDecl *H, FunctionDecl *B) {
     assert(ExtBase && "No base?");
 
     if (ExtBase != BaseMethod->getParent()) {
-      S.Diag(H->getLocation(), diag::err_hook_argument_type_mismatch)
-          << B->getQualifiedNameAsString();
+      S.Diag(H->getLocation(), diag::err_hook_member_base)
+          << BaseMethod->getParent()->getQualifiedNameAsString();
       return nullptr;
     }
   }
@@ -545,8 +588,8 @@ void clang::handleHookAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   }
 
   // Add attribute.
-  D->addAttr(::new (S.Context) HookAttr(
-      S.Context, AL, S.ML.FetchBaseOfHook(FD, BaseExpr)));
+  D->addAttr(::new (S.Context)
+                 HookAttr(S.Context, AL, S.ML.FetchBaseOfHook(FD, BaseExpr)));
 }
 
 void clang::handleRecordExtensionAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
