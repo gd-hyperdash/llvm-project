@@ -36,6 +36,7 @@
 #include "clang/AST/Type.h"
 #include "clang/AST/UnresolvedSet.h"
 #include "clang/Basic/AttrKinds.h"
+#include "clang/Basic/DiagnosticSema.h"
 #include "clang/Basic/ExceptionSpecificationType.h"
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Basic/LLVM.h"
@@ -940,6 +941,10 @@ void ASTDeclReader::VisitFunctionDecl(FunctionDecl *FD) {
   case FunctionDecl::TK_NonTemplate:
     mergeRedeclarable(FD, Redecl);
     break;
+  case FunctionDecl::TK_DependentNonTemplate:
+    mergeRedeclarable(FD, Redecl);
+    FD->setInstantiatedFromDecl(readDeclAs<FunctionDecl>());
+    break;
   case FunctionDecl::TK_FunctionTemplate:
     // Merged when we merge the template.
     FD->setDescribedFunctionTemplate(readDeclAs<FunctionTemplateDecl>());
@@ -1232,6 +1237,39 @@ void ASTDeclReader::VisitObjCIvarDecl(ObjCIvarDecl *IVD) {
   IVD->setNextIvar(nullptr);
   bool synth = Record.readInt();
   IVD->setSynthesize(synth);
+
+  // Check ivar redeclaration.
+  if (IVD->isInvalidDecl())
+    return;
+  // Don't check ObjCInterfaceDecl as interfaces are named and mismatches can be
+  // detected in VisitObjCInterfaceDecl. Here we are looking for redeclarations
+  // in extensions.
+  if (isa<ObjCInterfaceDecl>(IVD->getDeclContext()))
+    return;
+  ObjCInterfaceDecl *CanonIntf =
+      IVD->getContainingInterface()->getCanonicalDecl();
+  IdentifierInfo *II = IVD->getIdentifier();
+  ObjCIvarDecl *PrevIvar = CanonIntf->lookupInstanceVariable(II);
+  if (PrevIvar && PrevIvar != IVD) {
+    auto *ParentExt = dyn_cast<ObjCCategoryDecl>(IVD->getDeclContext());
+    auto *PrevParentExt =
+        dyn_cast<ObjCCategoryDecl>(PrevIvar->getDeclContext());
+    if (ParentExt && PrevParentExt) {
+      // Postpone diagnostic as we should merge identical extensions from
+      // different modules.
+      Reader
+          .PendingObjCExtensionIvarRedeclarations[std::make_pair(ParentExt,
+                                                                 PrevParentExt)]
+          .push_back(std::make_pair(IVD, PrevIvar));
+    } else if (ParentExt || PrevParentExt) {
+      // Duplicate ivars in extension + implementation are never compatible.
+      // Compatibility of implementation + implementation should be handled in
+      // VisitObjCImplementationDecl.
+      Reader.Diag(IVD->getLocation(), diag::err_duplicate_ivar_declaration)
+          << II;
+      Reader.Diag(PrevIvar->getLocation(), diag::note_previous_definition);
+    }
+  }
 }
 
 void ASTDeclReader::ReadObjCDefinitionData(
@@ -2382,13 +2420,17 @@ ASTDeclReader::VisitVarTemplateSpecializationDeclImpl(
   if (writtenAsCanonicalDecl) {
     auto *CanonPattern = readDeclAs<VarTemplateDecl>();
     if (D->isCanonicalDecl()) { // It's kept in the folding set.
-      // FIXME: If it's already present, merge it.
+      VarTemplateSpecializationDecl *CanonSpec;
       if (auto *Partial = dyn_cast<VarTemplatePartialSpecializationDecl>(D)) {
-        CanonPattern->getCommonPtr()->PartialSpecializations
-            .GetOrInsertNode(Partial);
+        CanonSpec = CanonPattern->getCommonPtr()
+                        ->PartialSpecializations.GetOrInsertNode(Partial);
       } else {
-        CanonPattern->getCommonPtr()->Specializations.GetOrInsertNode(D);
+        CanonSpec =
+            CanonPattern->getCommonPtr()->Specializations.GetOrInsertNode(D);
       }
+      // If we already have a matching specialization, merge it.
+      if (CanonSpec != D)
+        mergeRedeclarable<VarDecl>(D, CanonSpec, Redecl);
     }
   }
 

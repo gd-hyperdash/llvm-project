@@ -161,6 +161,7 @@ public:
     // Skip templated functions.
     switch (Decl->getTemplatedKind()) {
     case FunctionDecl::TK_NonTemplate:
+    case FunctionDecl::TK_DependentNonTemplate:
       break;
     case FunctionDecl::TK_MemberSpecialization:
     case FunctionDecl::TK_FunctionTemplateSpecialization:
@@ -793,7 +794,7 @@ void ExtractAPIAction::EndSourceFileAction() {
   // FIXME: Make the kind of APISerializer configurable.
   SymbolGraphSerializer SGSerializer(*API, ProductName);
   SGSerializer.serialize(*OS);
-  OS->flush();
+  OS.reset();
 }
 
 std::unique_ptr<raw_pwrite_stream>

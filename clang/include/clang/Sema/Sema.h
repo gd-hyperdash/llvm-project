@@ -788,23 +788,6 @@ public:
   /// context.
   unsigned FunctionScopesStart = 0;
 
-  /// Whether we are currently in the context of a mutable agnostic identifier
-  /// as described by CWG2569.
-  /// We are handling the unqualified-id of a decltype or noexcept expression.
-  bool InMutableAgnosticContext = false;
-
-  /// RAII object used to change the value of \c InMutableAgnosticContext
-  /// within a \c Sema object.
-  class MutableAgnosticContextRAII {
-    Sema &SemaRef;
-
-  public:
-    MutableAgnosticContextRAII(Sema &S) : SemaRef(S) {
-      SemaRef.InMutableAgnosticContext = true;
-    }
-    ~MutableAgnosticContextRAII() { SemaRef.InMutableAgnosticContext = false; }
-  };
-
   ArrayRef<sema::FunctionScopeInfo*> getFunctionScopes() const {
     return llvm::makeArrayRef(FunctionScopes.begin() + FunctionScopesStart,
                               FunctionScopes.end());
@@ -2259,7 +2242,7 @@ private:
   /// Namespace definitions that we will export when they finish.
   llvm::SmallPtrSet<const NamespaceDecl*, 8> DeferredExportedNamespaces;
 
-  /// Get the module whose scope we are currently within.
+  /// Get the module unit whose scope we are currently within.
   Module *getCurrentModule() const {
     return ModuleScopes.empty() ? nullptr : ModuleScopes.back().Module;
   }
@@ -2276,6 +2259,11 @@ private:
   void PopGlobalModuleFragment();
 
   VisibleModuleSet VisibleModules;
+
+  /// Cache for module units which is usable for current module.
+  llvm::DenseSet<const Module *> UsableModuleUnitsCache;
+
+  bool isUsableModule(const Module *M);
 
 public:
   /// Get the module owning an entity.
@@ -3509,6 +3497,8 @@ public:
   HLSLNumThreadsAttr *mergeHLSLNumThreadsAttr(Decl *D,
                                               const AttributeCommonInfo &AL,
                                               int X, int Y, int Z);
+  HLSLShaderAttr *mergeHLSLShaderAttr(Decl *D, const AttributeCommonInfo &AL,
+                                      HLSLShaderAttr::ShaderType ShaderType);
 
   void mergeDeclAttributes(NamedDecl *New, Decl *Old,
                            AvailabilityMergeKind AMK = AMK_Redeclaration);
@@ -3593,7 +3583,8 @@ public:
                                 QualType& ConvertedType);
   bool FunctionParamTypesAreEqual(const FunctionProtoType *OldType,
                                   const FunctionProtoType *NewType,
-                                  unsigned *ArgPos = nullptr);
+                                  unsigned *ArgPos = nullptr,
+                                  bool Reversed = false);
   void HandleFunctionTypeMismatch(PartialDiagnostic &PDiag,
                                   QualType FromType, QualType ToType);
 
@@ -4255,8 +4246,8 @@ public:
                                 = NotForRedeclaration);
   bool LookupBuiltin(LookupResult &R);
   void LookupNecessaryTypesForBuiltin(Scope *S, unsigned ID);
-  bool LookupName(LookupResult &R, Scope *S,
-                  bool AllowBuiltinCreation = false);
+  bool LookupName(LookupResult &R, Scope *S, bool AllowBuiltinCreation = false,
+                  bool ForceNoCPlusPlus = false);
   bool LookupQualifiedName(LookupResult &R, DeclContext *LookupCtx,
                            bool InUnqualifiedLookup = false);
   bool LookupQualifiedName(LookupResult &R, DeclContext *LookupCtx,
@@ -5289,9 +5280,6 @@ public:
       UnqualifiedId &Id, bool HasTrailingLParen, bool IsAddressOfOperand,
       CorrectionCandidateCallback *CCC = nullptr,
       bool IsInlineAsmIdentifier = false, Token *KeywordReplacement = nullptr);
-
-  ExprResult ActOnMutableAgnosticIdExpression(Scope *S, CXXScopeSpec &SS,
-                                              UnqualifiedId &Id);
 
   void DecomposeUnqualifiedId(const UnqualifiedId &Id,
                               TemplateArgumentListInfo &Buffer,
@@ -6875,9 +6863,11 @@ public:
   ///
   ///  CodeGen handles emission of lambda captures, ignoring these dummy
   ///  variables appropriately.
-  VarDecl *createLambdaInitCaptureVarDecl(
-      SourceLocation Loc, QualType InitCaptureType, SourceLocation EllipsisLoc,
-      IdentifierInfo *Id, unsigned InitStyle, Expr *Init, DeclContext *DeclCtx);
+  VarDecl *createLambdaInitCaptureVarDecl(SourceLocation Loc,
+                                          QualType InitCaptureType,
+                                          SourceLocation EllipsisLoc,
+                                          IdentifierInfo *Id,
+                                          unsigned InitStyle, Expr *Init);
 
   /// Add an init-capture to a lambda scope.
   void addInitCapture(sema::LambdaScopeInfo *LSI, VarDecl *Var);
@@ -6886,29 +6876,21 @@ public:
   /// given lambda.
   void finishLambdaExplicitCaptures(sema::LambdaScopeInfo *LSI);
 
-  /// Deduce a block or lambda's return type based on the return
-  /// statements present in the body.
-  void deduceClosureReturnType(sema::CapturingScopeInfo &CSI);
-
-  /// Once the Lambdas capture are known, we can
-  /// start to create the closure, call operator method,
-  /// and keep track of the captures.
-  /// We do the capture lookup here, but they are not actually captured
-  /// until after we know what the qualifiers of the call operator are.
-  void ActOnLambdaIntroducer(LambdaIntroducer &Intro, Scope *CurContext);
-
-  /// This is called after parsing the explicit template parameter list
+  /// \brief This is called after parsing the explicit template parameter list
   /// on a lambda (if it exists) in C++2a.
-  void ActOnLambdaExplicitTemplateParameterList(LambdaIntroducer &Intro,
-                                                SourceLocation LAngleLoc,
+  void ActOnLambdaExplicitTemplateParameterList(SourceLocation LAngleLoc,
                                                 ArrayRef<NamedDecl *> TParams,
                                                 SourceLocation RAngleLoc,
                                                 ExprResult RequiresClause);
 
-  void ActOnLambdaClosureQualifiers(
-      LambdaIntroducer &Intro, SourceLocation MutableLoc, SourceLocation EndLoc,
-      MutableArrayRef<DeclaratorChunk::ParamInfo> ParamInfo,
-      const DeclSpec &DS);
+  /// Introduce the lambda parameters into scope.
+  void addLambdaParameters(
+      ArrayRef<LambdaIntroducer::LambdaCapture> Captures,
+      CXXMethodDecl *CallOperator, Scope *CurScope);
+
+  /// Deduce a block or lambda's return type based on the return
+  /// statements present in the body.
+  void deduceClosureReturnType(sema::CapturingScopeInfo &CSI);
 
   /// ActOnStartOfLambdaDefinition - This is called just before we start
   /// parsing the body of a lambda; it analyzes the explicit captures and
@@ -7010,7 +6992,34 @@ private:
       LocalInstantiationScope &Scope,
       const MultiLevelTemplateArgumentList &TemplateArgs);
 
+  /// used by SetupConstraintCheckingTemplateArgumentsAndScope to recursively(in
+  /// the case of lambdas) set up the LocalInstantiationScope of the current
+  /// function.
+  bool SetupConstraintScope(
+      FunctionDecl *FD, llvm::Optional<ArrayRef<TemplateArgument>> TemplateArgs,
+      MultiLevelTemplateArgumentList MLTAL, LocalInstantiationScope &Scope);
+
+  /// Used during constraint checking, sets up the constraint template arguemnt
+  /// lists, and calls SetupConstraintScope to set up the
+  /// LocalInstantiationScope to have the proper set of ParVarDecls configured.
+  llvm::Optional<MultiLevelTemplateArgumentList>
+  SetupConstraintCheckingTemplateArgumentsAndScope(
+      FunctionDecl *FD, llvm::Optional<ArrayRef<TemplateArgument>> TemplateArgs,
+      LocalInstantiationScope &Scope);
+
+  // Keep track of whether we are evaluating a constraint.
+  unsigned ConstraintEvaluationDepth = 0;
+
+  class ConstraintEvalRAII {
+    Sema &S;
+
+  public:
+    ConstraintEvalRAII(Sema &S) : S(S) { ++S.ConstraintEvaluationDepth; }
+    ~ConstraintEvalRAII() { --S.ConstraintEvaluationDepth; }
+  };
+
 public:
+  bool IsEvaluatingAConstraint() { return ConstraintEvaluationDepth > 0; }
   const NormalizedConstraint *
   getNormalizedAssociatedConstraints(
       NamedDecl *ConstrainedDecl, ArrayRef<const Expr *> AssociatedConstraints);
@@ -7040,8 +7049,10 @@ public:
   /// check (either a concept or a constrained entity).
   /// \param ConstraintExprs a list of constraint expressions, treated as if
   /// they were 'AND'ed together.
-  /// \param TemplateArgs the list of template arguments to substitute into the
-  /// constraint expression.
+  /// \param TemplateArgList the multi-level list of template arguments to
+  /// substitute into the constraint expression. This should be relative to the
+  /// top-level (hence multi-level), since we need to instantiate fully at the
+  /// time of checking.
   /// \param TemplateIDRange The source range of the template id that
   /// caused the constraints check.
   /// \param Satisfaction if true is returned, will contain details of the
@@ -7051,7 +7062,40 @@ public:
   /// false otherwise.
   bool CheckConstraintSatisfaction(
       const NamedDecl *Template, ArrayRef<const Expr *> ConstraintExprs,
-      ArrayRef<TemplateArgument> TemplateArgs,
+      const MultiLevelTemplateArgumentList &TemplateArgList,
+      SourceRange TemplateIDRange, ConstraintSatisfaction &Satisfaction) {
+    llvm::SmallVector<Expr *, 4> Converted;
+    return CheckConstraintSatisfaction(Template, ConstraintExprs, Converted,
+                                       TemplateArgList, TemplateIDRange,
+                                       Satisfaction);
+  }
+
+  /// \brief Check whether the given list of constraint expressions are
+  /// satisfied (as if in a 'conjunction') given template arguments.
+  /// Additionally, takes an empty list of Expressions which is populated with
+  /// the instantiated versions of the ConstraintExprs.
+  /// \param Template the template-like entity that triggered the constraints
+  /// check (either a concept or a constrained entity).
+  /// \param ConstraintExprs a list of constraint expressions, treated as if
+  /// they were 'AND'ed together.
+  /// \param ConvertedConstraints a out parameter that will get populated with
+  /// the instantiated version of the ConstraintExprs if we successfully checked
+  /// satisfaction.
+  /// \param TemplateArgList the multi-level list of template arguments to
+  /// substitute into the constraint expression. This should be relative to the
+  /// top-level (hence multi-level), since we need to instantiate fully at the
+  /// time of checking.
+  /// \param TemplateIDRange The source range of the template id that
+  /// caused the constraints check.
+  /// \param Satisfaction if true is returned, will contain details of the
+  /// satisfaction, with enough information to diagnose an unsatisfied
+  /// expression.
+  /// \returns true if an error occurred and satisfaction could not be checked,
+  /// false otherwise.
+  bool CheckConstraintSatisfaction(
+      const NamedDecl *Template, ArrayRef<const Expr *> ConstraintExprs,
+      llvm::SmallVectorImpl<Expr *> &ConvertedConstraints,
+      const MultiLevelTemplateArgumentList &TemplateArgList,
       SourceRange TemplateIDRange, ConstraintSatisfaction &Satisfaction);
 
   /// \brief Check whether the given non-dependent constraint expression is
@@ -7087,9 +7131,9 @@ public:
   ///
   /// \returns true if the constrains are not satisfied or could not be checked
   /// for satisfaction, false if the constraints are satisfied.
-  bool EnsureTemplateArgumentListConstraints(TemplateDecl *Template,
-                                       ArrayRef<TemplateArgument> TemplateArgs,
-                                             SourceRange TemplateIDRange);
+  bool EnsureTemplateArgumentListConstraints(
+      TemplateDecl *Template, MultiLevelTemplateArgumentList TemplateArgs,
+      SourceRange TemplateIDRange);
 
   /// \brief Emit diagnostics explaining why a constraint expression was deemed
   /// unsatisfied.
@@ -8771,7 +8815,8 @@ public:
   FunctionTemplateDecl *getMoreSpecializedTemplate(
       FunctionTemplateDecl *FT1, FunctionTemplateDecl *FT2, SourceLocation Loc,
       TemplatePartialOrderingContext TPOC, unsigned NumCallArguments1,
-      unsigned NumCallArguments2, bool Reversed = false);
+      unsigned NumCallArguments2, bool Reversed = false,
+      bool AllowOrderingByConstraints = true);
   UnresolvedSetIterator
   getMostSpecialized(UnresolvedSetIterator SBegin, UnresolvedSetIterator SEnd,
                      TemplateSpecCandidateSet &FailedCandidates,
@@ -8822,7 +8867,8 @@ public:
 
   MultiLevelTemplateArgumentList getTemplateInstantiationArgs(
       const NamedDecl *D, const TemplateArgumentList *Innermost = nullptr,
-      bool RelativeToPrimary = false, const FunctionDecl *Pattern = nullptr);
+      bool RelativeToPrimary = false, const FunctionDecl *Pattern = nullptr,
+      bool LookBeyondLambda = false, bool IncludeContainingStruct = false);
 
   /// A context in which code is being synthesized (where a source location
   /// alone is not sufficient to identify the context). This covers template
@@ -9543,6 +9589,11 @@ public:
                       ExtParameterInfoBuilder &ParamInfos);
   ExprResult SubstExpr(Expr *E,
                        const MultiLevelTemplateArgumentList &TemplateArgs);
+  // Unlike the above, this evaluates constraints, which should only happen at
+  // 'constraint checking' time.
+  ExprResult
+  SubstConstraintExpr(Expr *E,
+                      const MultiLevelTemplateArgumentList &TemplateArgs);
 
   /// Substitute the given template arguments into a list of
   /// expressions, expanding pack expansions if required.

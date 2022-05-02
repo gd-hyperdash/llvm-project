@@ -63,6 +63,8 @@ def err_drv_no_cuda_libdevice : Error<
   "cannot find libdevice for %0; provide path to different CUDA installation "
   "via '--cuda-path', or pass '-nocudalib' to build without linking with "
   "libdevice">;
+def err_drv_no_rdc_new_driver : Error<
+  "Using '--offload-new-driver' requires '-fgpu-rdc'">;
 
 def err_drv_no_rocm_device_lib : Error<
   "cannot find ROCm device library%select{| for %1|for ABI version %1}0; provide its path via "
@@ -107,8 +109,8 @@ def err_drv_bad_offload_arch_combo : Error<
   "a feature should either exist in all offload archs, or not exist in any "
   "offload archs)">;
 def warn_drv_unsupported_option_for_offload_arch_req_feature : Warning<
-  "ignoring '%0' option as it is not currently supported for "
-  "offload arch '%1'. Use it with an offload arch containing '%2' instead">,
+  "ignoring '%0' option for offload arch '%1' as it is not currently supported "
+  "there. Use it with an offload arch containing '%2' instead">,
   InGroup<OptionIgnored>;
 def warn_drv_unsupported_option_for_target : Warning<
   "ignoring '%0' option as it is not currently supported for target '%1'">,
@@ -149,6 +151,8 @@ def err_drv_invalid_darwin_version : Error<
   "invalid Darwin version number: %0">;
 def err_drv_invalid_diagnotics_hotness_threshold : Error<
   "invalid argument in '%0', only integer or 'auto' is supported">;
+def err_drv_invalid_diagnotics_misexpect_tolerance : Error<
+  "invalid argument in '%0', only integers are supported">;
 def err_drv_missing_argument : Error<
   "argument to '%0' is missing (expected %1 value%s1)">;
 def err_drv_invalid_Xarch_argument_with_args : Error<
@@ -376,6 +380,9 @@ def warn_drv_empty_joined_argument : Warning<
   "joined argument expects additional value: '%0'">,
   InGroup<UnusedCommandLineArgument>;
 def warn_drv_diagnostics_hotness_requires_pgo : Warning<
+  "argument '%0' requires profile-guided optimization information">,
+  InGroup<UnusedCommandLineArgument>;
+def warn_drv_diagnostics_misexpect_requires_pgo : Warning<
   "argument '%0' requires profile-guided optimization information">,
   InGroup<UnusedCommandLineArgument>;
 def warn_drv_clang_unsupported : Warning<
@@ -660,4 +667,13 @@ def err_drv_target_variant_invalid : Error<
 def err_drv_invalid_directx_shader_module : Error<
   "invalid profile : %0">;
 
+def err_drv_invalid_range_dxil_validator_version : Error<
+  "invalid validator version : %0\n"
+  "Validator version must be less than or equal to current internal version.">;
+def err_drv_invalid_format_dxil_validator_version : Error<
+  "invalid validator version : %0\n"
+  "Format of validator version is \"<major>.<minor>\" (ex:\"1.4\").">;
+def err_drv_invalid_empty_dxil_validator_version : Error<
+  "invalid validator version : %0\n"
+  "If validator major version is 0, minor version must also be 0.">;
 }

@@ -164,6 +164,15 @@ static cl::opt<int> LookAheadMaxDepth(
     "slp-max-look-ahead-depth", cl::init(2), cl::Hidden,
     cl::desc("The maximum look-ahead depth for operand reordering scores"));
 
+// The maximum depth that the look-ahead score heuristic will explore
+// when it probing among candidates for vectorization tree roots.
+// The higher this value, the higher the compilation time overhead but unlike
+// similar limit for operands ordering this is less frequently used, hence
+// impact of higher value is less noticeable.
+static cl::opt<int> RootLookAheadMaxDepth(
+    "slp-max-root-look-ahead-depth", cl::init(2), cl::Hidden,
+    cl::desc("The maximum look-ahead depth for searching best rooting option"));
+
 static cl::opt<bool>
     ViewSLPTree("view-slp-tree", cl::Hidden,
                 cl::desc("Display the SLP trees with Graphviz"));
@@ -632,7 +641,7 @@ static bool InTreeUserNeedToExtract(Value *Scalar, Instruction *UserInst,
     CallInst *CI = cast<CallInst>(UserInst);
     Intrinsic::ID ID = getVectorIntrinsicIDForCall(CI, TLI);
     for (unsigned i = 0, e = CI->arg_size(); i != e; ++i) {
-      if (hasVectorInstrinsicScalarOpd(ID, i))
+      if (hasVectorIntrinsicScalarOpd(ID, i))
         return (CI->getArgOperand(i) == Scalar);
     }
     LLVM_FALLTHROUGH;
@@ -1034,6 +1043,274 @@ public:
 #endif
   };
 
+  /// A helper class used for scoring candidates for two consecutive lanes.
+  class LookAheadHeuristics {
+    const DataLayout &DL;
+    ScalarEvolution &SE;
+    const BoUpSLP &R;
+    int NumLanes; // Total number of lanes (aka vectorization factor).
+    int MaxLevel; // The maximum recursion depth for accumulating score.
+
+  public:
+    LookAheadHeuristics(const DataLayout &DL, ScalarEvolution &SE,
+                        const BoUpSLP &R, int NumLanes, int MaxLevel)
+        : DL(DL), SE(SE), R(R), NumLanes(NumLanes), MaxLevel(MaxLevel) {}
+
+    // The hard-coded scores listed here are not very important, though it shall
+    // be higher for better matches to improve the resulting cost. When
+    // computing the scores of matching one sub-tree with another, we are
+    // basically counting the number of values that are matching. So even if all
+    // scores are set to 1, we would still get a decent matching result.
+    // However, sometimes we have to break ties. For example we may have to
+    // choose between matching loads vs matching opcodes. This is what these
+    // scores are helping us with: they provide the order of preference. Also,
+    // this is important if the scalar is externally used or used in another
+    // tree entry node in the different lane.
+
+    /// Loads from consecutive memory addresses, e.g. load(A[i]), load(A[i+1]).
+    static const int ScoreConsecutiveLoads = 4;
+    /// The same load multiple times. This should have a better score than
+    /// `ScoreSplat` because it in x86 for a 2-lane vector we can represent it
+    /// with `movddup (%reg), xmm0` which has a throughput of 0.5 versus 0.5 for
+    /// a vector load and 1.0 for a broadcast.
+    static const int ScoreSplatLoads = 3;
+    /// Loads from reversed memory addresses, e.g. load(A[i+1]), load(A[i]).
+    static const int ScoreReversedLoads = 3;
+    /// ExtractElementInst from same vector and consecutive indexes.
+    static const int ScoreConsecutiveExtracts = 4;
+    /// ExtractElementInst from same vector and reversed indices.
+    static const int ScoreReversedExtracts = 3;
+    /// Constants.
+    static const int ScoreConstants = 2;
+    /// Instructions with the same opcode.
+    static const int ScoreSameOpcode = 2;
+    /// Instructions with alt opcodes (e.g, add + sub).
+    static const int ScoreAltOpcodes = 1;
+    /// Identical instructions (a.k.a. splat or broadcast).
+    static const int ScoreSplat = 1;
+    /// Matching with an undef is preferable to failing.
+    static const int ScoreUndef = 1;
+    /// Score for failing to find a decent match.
+    static const int ScoreFail = 0;
+    /// Score if all users are vectorized.
+    static const int ScoreAllUserVectorized = 1;
+
+    /// \returns the score of placing \p V1 and \p V2 in consecutive lanes.
+    /// \p U1 and \p U2 are the users of \p V1 and \p V2.
+    /// Also, checks if \p V1 and \p V2 are compatible with instructions in \p
+    /// MainAltOps.
+    int getShallowScore(Value *V1, Value *V2, Instruction *U1, Instruction *U2,
+                        ArrayRef<Value *> MainAltOps) const {
+      if (V1 == V2) {
+        if (isa<LoadInst>(V1)) {
+          // Retruns true if the users of V1 and V2 won't need to be extracted.
+          auto AllUsersAreInternal = [U1, U2, this](Value *V1, Value *V2) {
+            // Bail out if we have too many uses to save compilation time.
+            static constexpr unsigned Limit = 8;
+            if (V1->hasNUsesOrMore(Limit) || V2->hasNUsesOrMore(Limit))
+              return false;
+
+            auto AllUsersVectorized = [U1, U2, this](Value *V) {
+              return llvm::all_of(V->users(), [U1, U2, this](Value *U) {
+                return U == U1 || U == U2 || R.getTreeEntry(U) != nullptr;
+              });
+            };
+            return AllUsersVectorized(V1) && AllUsersVectorized(V2);
+          };
+          // A broadcast of a load can be cheaper on some targets.
+          if (R.TTI->isLegalBroadcastLoad(V1->getType(),
+                                          ElementCount::getFixed(NumLanes)) &&
+              ((int)V1->getNumUses() == NumLanes ||
+               AllUsersAreInternal(V1, V2)))
+            return LookAheadHeuristics::ScoreSplatLoads;
+        }
+        return LookAheadHeuristics::ScoreSplat;
+      }
+
+      auto *LI1 = dyn_cast<LoadInst>(V1);
+      auto *LI2 = dyn_cast<LoadInst>(V2);
+      if (LI1 && LI2) {
+        if (LI1->getParent() != LI2->getParent())
+          return LookAheadHeuristics::ScoreFail;
+
+        Optional<int> Dist = getPointersDiff(
+            LI1->getType(), LI1->getPointerOperand(), LI2->getType(),
+            LI2->getPointerOperand(), DL, SE, /*StrictCheck=*/true);
+        if (!Dist || *Dist == 0)
+          return LookAheadHeuristics::ScoreFail;
+        // The distance is too large - still may be profitable to use masked
+        // loads/gathers.
+        if (std::abs(*Dist) > NumLanes / 2)
+          return LookAheadHeuristics::ScoreAltOpcodes;
+        // This still will detect consecutive loads, but we might have "holes"
+        // in some cases. It is ok for non-power-2 vectorization and may produce
+        // better results. It should not affect current vectorization.
+        return (*Dist > 0) ? LookAheadHeuristics::ScoreConsecutiveLoads
+                           : LookAheadHeuristics::ScoreReversedLoads;
+      }
+
+      auto *C1 = dyn_cast<Constant>(V1);
+      auto *C2 = dyn_cast<Constant>(V2);
+      if (C1 && C2)
+        return LookAheadHeuristics::ScoreConstants;
+
+      // Extracts from consecutive indexes of the same vector better score as
+      // the extracts could be optimized away.
+      Value *EV1;
+      ConstantInt *Ex1Idx;
+      if (match(V1, m_ExtractElt(m_Value(EV1), m_ConstantInt(Ex1Idx)))) {
+        // Undefs are always profitable for extractelements.
+        if (isa<UndefValue>(V2))
+          return LookAheadHeuristics::ScoreConsecutiveExtracts;
+        Value *EV2 = nullptr;
+        ConstantInt *Ex2Idx = nullptr;
+        if (match(V2,
+                  m_ExtractElt(m_Value(EV2), m_CombineOr(m_ConstantInt(Ex2Idx),
+                                                         m_Undef())))) {
+          // Undefs are always profitable for extractelements.
+          if (!Ex2Idx)
+            return LookAheadHeuristics::ScoreConsecutiveExtracts;
+          if (isUndefVector(EV2) && EV2->getType() == EV1->getType())
+            return LookAheadHeuristics::ScoreConsecutiveExtracts;
+          if (EV2 == EV1) {
+            int Idx1 = Ex1Idx->getZExtValue();
+            int Idx2 = Ex2Idx->getZExtValue();
+            int Dist = Idx2 - Idx1;
+            // The distance is too large - still may be profitable to use
+            // shuffles.
+            if (std::abs(Dist) == 0)
+              return LookAheadHeuristics::ScoreSplat;
+            if (std::abs(Dist) > NumLanes / 2)
+              return LookAheadHeuristics::ScoreSameOpcode;
+            return (Dist > 0) ? LookAheadHeuristics::ScoreConsecutiveExtracts
+                              : LookAheadHeuristics::ScoreReversedExtracts;
+          }
+          return LookAheadHeuristics::ScoreAltOpcodes;
+        }
+        return LookAheadHeuristics::ScoreFail;
+      }
+
+      auto *I1 = dyn_cast<Instruction>(V1);
+      auto *I2 = dyn_cast<Instruction>(V2);
+      if (I1 && I2) {
+        if (I1->getParent() != I2->getParent())
+          return LookAheadHeuristics::ScoreFail;
+        SmallVector<Value *, 4> Ops(MainAltOps.begin(), MainAltOps.end());
+        Ops.push_back(I1);
+        Ops.push_back(I2);
+        InstructionsState S = getSameOpcode(Ops);
+        // Note: Only consider instructions with <= 2 operands to avoid
+        // complexity explosion.
+        if (S.getOpcode() &&
+            (S.MainOp->getNumOperands() <= 2 || !MainAltOps.empty() ||
+             !S.isAltShuffle()) &&
+            all_of(Ops, [&S](Value *V) {
+              return cast<Instruction>(V)->getNumOperands() ==
+                     S.MainOp->getNumOperands();
+            }))
+          return S.isAltShuffle() ? LookAheadHeuristics::ScoreAltOpcodes
+                                  : LookAheadHeuristics::ScoreSameOpcode;
+      }
+
+      if (isa<UndefValue>(V2))
+        return LookAheadHeuristics::ScoreUndef;
+
+      return LookAheadHeuristics::ScoreFail;
+    }
+
+    /// Go through the operands of \p LHS and \p RHS recursively until
+    /// MaxLevel, and return the cummulative score. \p U1 and \p U2 are
+    /// the users of \p LHS and \p RHS (that is \p LHS and \p RHS are operands
+    /// of \p U1 and \p U2), except at the beginning of the recursion where
+    /// these are set to nullptr.
+    ///
+    /// For example:
+    /// \verbatim
+    ///  A[0]  B[0]  A[1]  B[1]  C[0] D[0]  B[1] A[1]
+    ///     \ /         \ /         \ /        \ /
+    ///      +           +           +          +
+    ///     G1          G2          G3         G4
+    /// \endverbatim
+    /// The getScoreAtLevelRec(G1, G2) function will try to match the nodes at
+    /// each level recursively, accumulating the score. It starts from matching
+    /// the additions at level 0, then moves on to the loads (level 1). The
+    /// score of G1 and G2 is higher than G1 and G3, because {A[0],A[1]} and
+    /// {B[0],B[1]} match with LookAheadHeuristics::ScoreConsecutiveLoads, while
+    /// {A[0],C[0]} has a score of LookAheadHeuristics::ScoreFail.
+    /// Please note that the order of the operands does not matter, as we
+    /// evaluate the score of all profitable combinations of operands. In
+    /// other words the score of G1 and G4 is the same as G1 and G2. This
+    /// heuristic is based on ideas described in:
+    ///   Look-ahead SLP: Auto-vectorization in the presence of commutative
+    ///   operations, CGO 2018 by Vasileios Porpodas, Rodrigo C. O. Rocha,
+    ///   Luís F. W. Góes
+    int getScoreAtLevelRec(Value *LHS, Value *RHS, Instruction *U1,
+                           Instruction *U2, int CurrLevel,
+                           ArrayRef<Value *> MainAltOps) const {
+
+      // Get the shallow score of V1 and V2.
+      int ShallowScoreAtThisLevel =
+          getShallowScore(LHS, RHS, U1, U2, MainAltOps);
+
+      // If reached MaxLevel,
+      //  or if V1 and V2 are not instructions,
+      //  or if they are SPLAT,
+      //  or if they are not consecutive,
+      //  or if profitable to vectorize loads or extractelements, early return
+      //  the current cost.
+      auto *I1 = dyn_cast<Instruction>(LHS);
+      auto *I2 = dyn_cast<Instruction>(RHS);
+      if (CurrLevel == MaxLevel || !(I1 && I2) || I1 == I2 ||
+          ShallowScoreAtThisLevel == LookAheadHeuristics::ScoreFail ||
+          (((isa<LoadInst>(I1) && isa<LoadInst>(I2)) ||
+            (I1->getNumOperands() > 2 && I2->getNumOperands() > 2) ||
+            (isa<ExtractElementInst>(I1) && isa<ExtractElementInst>(I2))) &&
+           ShallowScoreAtThisLevel))
+        return ShallowScoreAtThisLevel;
+      assert(I1 && I2 && "Should have early exited.");
+
+      // Contains the I2 operand indexes that got matched with I1 operands.
+      SmallSet<unsigned, 4> Op2Used;
+
+      // Recursion towards the operands of I1 and I2. We are trying all possible
+      // operand pairs, and keeping track of the best score.
+      for (unsigned OpIdx1 = 0, NumOperands1 = I1->getNumOperands();
+           OpIdx1 != NumOperands1; ++OpIdx1) {
+        // Try to pair op1I with the best operand of I2.
+        int MaxTmpScore = 0;
+        unsigned MaxOpIdx2 = 0;
+        bool FoundBest = false;
+        // If I2 is commutative try all combinations.
+        unsigned FromIdx = isCommutative(I2) ? 0 : OpIdx1;
+        unsigned ToIdx = isCommutative(I2)
+                             ? I2->getNumOperands()
+                             : std::min(I2->getNumOperands(), OpIdx1 + 1);
+        assert(FromIdx <= ToIdx && "Bad index");
+        for (unsigned OpIdx2 = FromIdx; OpIdx2 != ToIdx; ++OpIdx2) {
+          // Skip operands already paired with OpIdx1.
+          if (Op2Used.count(OpIdx2))
+            continue;
+          // Recursively calculate the cost at each level
+          int TmpScore =
+              getScoreAtLevelRec(I1->getOperand(OpIdx1), I2->getOperand(OpIdx2),
+                                 I1, I2, CurrLevel + 1, None);
+          // Look for the best score.
+          if (TmpScore > LookAheadHeuristics::ScoreFail &&
+              TmpScore > MaxTmpScore) {
+            MaxTmpScore = TmpScore;
+            MaxOpIdx2 = OpIdx2;
+            FoundBest = true;
+          }
+        }
+        if (FoundBest) {
+          // Pair {OpIdx1, MaxOpIdx2} was found to be best. Never revisit it.
+          Op2Used.insert(MaxOpIdx2);
+          ShallowScoreAtThisLevel += MaxTmpScore;
+        }
+      }
+      return ShallowScoreAtThisLevel;
+    }
+  };
   /// A helper data structure to hold the operands of a vector of instructions.
   /// This supports a fixed vector length for all operand vectors.
   class VLOperands {
@@ -1125,167 +1402,6 @@ public:
       std::swap(OpsVec[OpIdx1][Lane], OpsVec[OpIdx2][Lane]);
     }
 
-    // The hard-coded scores listed here are not very important, though it shall
-    // be higher for better matches to improve the resulting cost. When
-    // computing the scores of matching one sub-tree with another, we are
-    // basically counting the number of values that are matching. So even if all
-    // scores are set to 1, we would still get a decent matching result.
-    // However, sometimes we have to break ties. For example we may have to
-    // choose between matching loads vs matching opcodes. This is what these
-    // scores are helping us with: they provide the order of preference. Also,
-    // this is important if the scalar is externally used or used in another
-    // tree entry node in the different lane.
-
-    /// Loads from consecutive memory addresses, e.g. load(A[i]), load(A[i+1]).
-    static const int ScoreConsecutiveLoads = 4;
-    /// The same load multiple times. This should have a better score than
-    /// `ScoreSplat` because it in x86 for a 2-lane vector we can represent it
-    /// with `movddup (%reg), xmm0` which has a throughput of 0.5 versus 0.5 for
-    /// a vector load and 1.0 for a broadcast.
-    static const int ScoreSplatLoads = 3;
-    /// Loads from reversed memory addresses, e.g. load(A[i+1]), load(A[i]).
-    static const int ScoreReversedLoads = 3;
-    /// ExtractElementInst from same vector and consecutive indexes.
-    static const int ScoreConsecutiveExtracts = 4;
-    /// ExtractElementInst from same vector and reversed indices.
-    static const int ScoreReversedExtracts = 3;
-    /// Constants.
-    static const int ScoreConstants = 2;
-    /// Instructions with the same opcode.
-    static const int ScoreSameOpcode = 2;
-    /// Instructions with alt opcodes (e.g, add + sub).
-    static const int ScoreAltOpcodes = 1;
-    /// Identical instructions (a.k.a. splat or broadcast).
-    static const int ScoreSplat = 1;
-    /// Matching with an undef is preferable to failing.
-    static const int ScoreUndef = 1;
-    /// Score for failing to find a decent match.
-    static const int ScoreFail = 0;
-    /// Score if all users are vectorized.
-    static const int ScoreAllUserVectorized = 1;
-
-    /// \returns the score of placing \p V1 and \p V2 in consecutive lanes.
-    /// Also, checks if \p V1 and \p V2 are compatible with instructions in \p
-    /// MainAltOps.
-    int getShallowScore(Value *V1, Value *V2, Instruction *U1, Instruction *U2,
-                        const DataLayout &DL, ScalarEvolution &SE, int NumLanes,
-                        ArrayRef<Value *> MainAltOps) {
-      if (V1 == V2) {
-        if (isa<LoadInst>(V1)) {
-          // Retruns true if the users of V1 and V2 won't need to be extracted.
-          auto AllUsersAreInternal = [U1, U2, this](Value *V1, Value *V2) {
-            // Bail out if we have too many uses to save compilation time.
-            static constexpr unsigned Limit = 8;
-            if (V1->hasNUsesOrMore(Limit) || V2->hasNUsesOrMore(Limit))
-              return false;
-
-            auto AllUsersVectorized = [U1, U2, this](Value *V) {
-              return llvm::all_of(V->users(), [U1, U2, this](Value *U) {
-                return U == U1 || U == U2 || R.getTreeEntry(U) != nullptr;
-              });
-            };
-            return AllUsersVectorized(V1) && AllUsersVectorized(V2);
-          };
-          // A broadcast of a load can be cheaper on some targets.
-          if (R.TTI->isLegalBroadcastLoad(V1->getType(), NumLanes) &&
-              ((int)V1->getNumUses() == NumLanes ||
-               AllUsersAreInternal(V1, V2)))
-            return VLOperands::ScoreSplatLoads;
-        }
-        return VLOperands::ScoreSplat;
-      }
-
-      auto *LI1 = dyn_cast<LoadInst>(V1);
-      auto *LI2 = dyn_cast<LoadInst>(V2);
-      if (LI1 && LI2) {
-        if (LI1->getParent() != LI2->getParent())
-          return VLOperands::ScoreFail;
-
-        Optional<int> Dist = getPointersDiff(
-            LI1->getType(), LI1->getPointerOperand(), LI2->getType(),
-            LI2->getPointerOperand(), DL, SE, /*StrictCheck=*/true);
-        if (!Dist || *Dist == 0)
-          return VLOperands::ScoreFail;
-        // The distance is too large - still may be profitable to use masked
-        // loads/gathers.
-        if (std::abs(*Dist) > NumLanes / 2)
-          return VLOperands::ScoreAltOpcodes;
-        // This still will detect consecutive loads, but we might have "holes"
-        // in some cases. It is ok for non-power-2 vectorization and may produce
-        // better results. It should not affect current vectorization.
-        return (*Dist > 0) ? VLOperands::ScoreConsecutiveLoads
-                           : VLOperands::ScoreReversedLoads;
-      }
-
-      auto *C1 = dyn_cast<Constant>(V1);
-      auto *C2 = dyn_cast<Constant>(V2);
-      if (C1 && C2)
-        return VLOperands::ScoreConstants;
-
-      // Extracts from consecutive indexes of the same vector better score as
-      // the extracts could be optimized away.
-      Value *EV1;
-      ConstantInt *Ex1Idx;
-      if (match(V1, m_ExtractElt(m_Value(EV1), m_ConstantInt(Ex1Idx)))) {
-        // Undefs are always profitable for extractelements.
-        if (isa<UndefValue>(V2))
-          return VLOperands::ScoreConsecutiveExtracts;
-        Value *EV2 = nullptr;
-        ConstantInt *Ex2Idx = nullptr;
-        if (match(V2,
-                  m_ExtractElt(m_Value(EV2), m_CombineOr(m_ConstantInt(Ex2Idx),
-                                                         m_Undef())))) {
-          // Undefs are always profitable for extractelements.
-          if (!Ex2Idx)
-            return VLOperands::ScoreConsecutiveExtracts;
-          if (isUndefVector(EV2) && EV2->getType() == EV1->getType())
-            return VLOperands::ScoreConsecutiveExtracts;
-          if (EV2 == EV1) {
-            int Idx1 = Ex1Idx->getZExtValue();
-            int Idx2 = Ex2Idx->getZExtValue();
-            int Dist = Idx2 - Idx1;
-            // The distance is too large - still may be profitable to use
-            // shuffles.
-            if (std::abs(Dist) == 0)
-              return VLOperands::ScoreSplat;
-            if (std::abs(Dist) > NumLanes / 2)
-              return VLOperands::ScoreSameOpcode;
-            return (Dist > 0) ? VLOperands::ScoreConsecutiveExtracts
-                              : VLOperands::ScoreReversedExtracts;
-          }
-          return VLOperands::ScoreAltOpcodes;
-        }
-        return VLOperands::ScoreFail;
-      }
-
-      auto *I1 = dyn_cast<Instruction>(V1);
-      auto *I2 = dyn_cast<Instruction>(V2);
-      if (I1 && I2) {
-        if (I1->getParent() != I2->getParent())
-          return VLOperands::ScoreFail;
-        SmallVector<Value *, 4> Ops(MainAltOps.begin(), MainAltOps.end());
-        Ops.push_back(I1);
-        Ops.push_back(I2);
-        InstructionsState S = getSameOpcode(Ops);
-        // Note: Only consider instructions with <= 2 operands to avoid
-        // complexity explosion.
-        if (S.getOpcode() &&
-            (S.MainOp->getNumOperands() <= 2 || !MainAltOps.empty() ||
-             !S.isAltShuffle()) &&
-            all_of(Ops, [&S](Value *V) {
-              return cast<Instruction>(V)->getNumOperands() ==
-                     S.MainOp->getNumOperands();
-            }))
-          return S.isAltShuffle() ? VLOperands::ScoreAltOpcodes
-                                  : VLOperands::ScoreSameOpcode;
-      }
-
-      if (isa<UndefValue>(V2))
-        return VLOperands::ScoreUndef;
-
-      return VLOperands::ScoreFail;
-    }
-
     /// \param Lane lane of the operands under analysis.
     /// \param OpIdx operand index in \p Lane lane we're looking the best
     /// candidate for.
@@ -1337,100 +1453,13 @@ public:
       // remove it.
       if (isVectorLikeInstWithConstOps(IdxLaneV) &&
           isVectorLikeInstWithConstOps(OpIdxLaneV))
-        return VLOperands::ScoreAllUserVectorized;
+        return LookAheadHeuristics::ScoreAllUserVectorized;
       auto *IdxLaneI = dyn_cast<Instruction>(IdxLaneV);
       if (!IdxLaneI || !isa<Instruction>(OpIdxLaneV))
         return 0;
       return R.areAllUsersVectorized(IdxLaneI, None)
-                 ? VLOperands::ScoreAllUserVectorized
+                 ? LookAheadHeuristics::ScoreAllUserVectorized
                  : 0;
-    }
-
-    /// Go through the operands of \p LHS and \p RHS recursively until \p
-    /// MaxLevel, and return the cummulative score. For example:
-    /// \verbatim
-    ///  A[0]  B[0]  A[1]  B[1]  C[0] D[0]  B[1] A[1]
-    ///     \ /         \ /         \ /        \ /
-    ///      +           +           +          +
-    ///     G1          G2          G3         G4
-    /// \endverbatim
-    /// The getScoreAtLevelRec(G1, G2) function will try to match the nodes at
-    /// each level recursively, accumulating the score. It starts from matching
-    /// the additions at level 0, then moves on to the loads (level 1). The
-    /// score of G1 and G2 is higher than G1 and G3, because {A[0],A[1]} and
-    /// {B[0],B[1]} match with VLOperands::ScoreConsecutiveLoads, while
-    /// {A[0],C[0]} has a score of VLOperands::ScoreFail.
-    /// Please note that the order of the operands does not matter, as we
-    /// evaluate the score of all profitable combinations of operands. In
-    /// other words the score of G1 and G4 is the same as G1 and G2. This
-    /// heuristic is based on ideas described in:
-    ///   Look-ahead SLP: Auto-vectorization in the presence of commutative
-    ///   operations, CGO 2018 by Vasileios Porpodas, Rodrigo C. O. Rocha,
-    ///   Luís F. W. Góes
-    int getScoreAtLevelRec(Value *LHS, Value *RHS, Instruction *U1,
-                           Instruction *U2, int CurrLevel, int MaxLevel,
-                           ArrayRef<Value *> MainAltOps) {
-
-      // Get the shallow score of V1 and V2.
-      int ShallowScoreAtThisLevel =
-          getShallowScore(LHS, RHS, U1, U2, DL, SE, getNumLanes(), MainAltOps);
-
-      // If reached MaxLevel,
-      //  or if V1 and V2 are not instructions,
-      //  or if they are SPLAT,
-      //  or if they are not consecutive,
-      //  or if profitable to vectorize loads or extractelements, early return
-      //  the current cost.
-      auto *I1 = dyn_cast<Instruction>(LHS);
-      auto *I2 = dyn_cast<Instruction>(RHS);
-      if (CurrLevel == MaxLevel || !(I1 && I2) || I1 == I2 ||
-          ShallowScoreAtThisLevel == VLOperands::ScoreFail ||
-          (((isa<LoadInst>(I1) && isa<LoadInst>(I2)) ||
-            (I1->getNumOperands() > 2 && I2->getNumOperands() > 2) ||
-            (isa<ExtractElementInst>(I1) && isa<ExtractElementInst>(I2))) &&
-           ShallowScoreAtThisLevel))
-        return ShallowScoreAtThisLevel;
-      assert(I1 && I2 && "Should have early exited.");
-
-      // Contains the I2 operand indexes that got matched with I1 operands.
-      SmallSet<unsigned, 4> Op2Used;
-
-      // Recursion towards the operands of I1 and I2. We are trying all possible
-      // operand pairs, and keeping track of the best score.
-      for (unsigned OpIdx1 = 0, NumOperands1 = I1->getNumOperands();
-           OpIdx1 != NumOperands1; ++OpIdx1) {
-        // Try to pair op1I with the best operand of I2.
-        int MaxTmpScore = 0;
-        unsigned MaxOpIdx2 = 0;
-        bool FoundBest = false;
-        // If I2 is commutative try all combinations.
-        unsigned FromIdx = isCommutative(I2) ? 0 : OpIdx1;
-        unsigned ToIdx = isCommutative(I2)
-                             ? I2->getNumOperands()
-                             : std::min(I2->getNumOperands(), OpIdx1 + 1);
-        assert(FromIdx <= ToIdx && "Bad index");
-        for (unsigned OpIdx2 = FromIdx; OpIdx2 != ToIdx; ++OpIdx2) {
-          // Skip operands already paired with OpIdx1.
-          if (Op2Used.count(OpIdx2))
-            continue;
-          // Recursively calculate the cost at each level
-          int TmpScore =
-              getScoreAtLevelRec(I1->getOperand(OpIdx1), I2->getOperand(OpIdx2),
-                                 I1, I2, CurrLevel + 1, MaxLevel, None);
-          // Look for the best score.
-          if (TmpScore > VLOperands::ScoreFail && TmpScore > MaxTmpScore) {
-            MaxTmpScore = TmpScore;
-            MaxOpIdx2 = OpIdx2;
-            FoundBest = true;
-          }
-        }
-        if (FoundBest) {
-          // Pair {OpIdx1, MaxOpIdx2} was found to be best. Never revisit it.
-          Op2Used.insert(MaxOpIdx2);
-          ShallowScoreAtThisLevel += MaxTmpScore;
-        }
-      }
-      return ShallowScoreAtThisLevel;
     }
 
     /// Score scaling factor for fully compatible instructions but with
@@ -1446,10 +1475,13 @@ public:
     int getLookAheadScore(Value *LHS, Value *RHS, ArrayRef<Value *> MainAltOps,
                           int Lane, unsigned OpIdx, unsigned Idx,
                           bool &IsUsed) {
+      LookAheadHeuristics LookAhead(DL, SE, R, getNumLanes(),
+                                    LookAheadMaxDepth);
       // Keep track of the instruction stack as we recurse into the operands
       // during the look-ahead score exploration.
-      int Score = getScoreAtLevelRec(LHS, RHS, /*U1=*/nullptr, /*U2=*/nullptr,
-                                     1, LookAheadMaxDepth, MainAltOps);
+      int Score =
+          LookAhead.getScoreAtLevelRec(LHS, RHS, /*U1=*/nullptr, /*U2=*/nullptr,
+                                       /*CurrLevel=*/1, MainAltOps);
       if (Score) {
         int SplatScore = getSplatScore(Lane, OpIdx, Idx);
         if (Score <= -SplatScore) {
@@ -1977,6 +2009,29 @@ public:
 #endif
   };
 
+  /// Evaluate each pair in \p Candidates and return index into \p Candidates
+  /// for a pair which have highest score deemed to have best chance to form
+  /// root of profitable tree to vectorize. Return None if no candidate scored
+  /// above the LookAheadHeuristics::ScoreFail.
+  Optional<int>
+  findBestRootPair(ArrayRef<std::pair<Value *, Value *>> Candidates) {
+    LookAheadHeuristics LookAhead(*DL, *SE, *this, /*NumLanes=*/2,
+                                  RootLookAheadMaxDepth);
+    int BestScore = LookAheadHeuristics::ScoreFail;
+    Optional<int> Index = None;
+    for (int I : seq<int>(0, Candidates.size())) {
+      int Score = LookAhead.getScoreAtLevelRec(Candidates[I].first,
+                                               Candidates[I].second,
+                                               /*U1=*/nullptr, /*U2=*/nullptr,
+                                               /*Level=*/1, None);
+      if (Score > BestScore) {
+        BestScore = Score;
+        Index = I;
+      }
+    }
+    return Index;
+  }
+
   /// Checks if the instruction is marked for deletion.
   bool isDeleted(Instruction *I) const { return DeletedInstructions.count(I); }
 
@@ -2488,7 +2543,7 @@ private:
   /// Maps a specific scalar to its tree entry.
   SmallDenseMap<Value*, TreeEntry *> ScalarToTreeEntry;
 
-  /// Maps a value to the proposed vectorizable size.
+  /// Maps a value to the proposed vectorizable size.
   SmallDenseMap<Value *, unsigned> InstrElementSize;
 
   /// A list of scalars that we found that we need to keep as scalars.
@@ -3238,7 +3293,7 @@ BoUpSLP::~BoUpSLP() {
 
   // Cleanup any dead scalar code feeding the vectorized instructions
   RecursivelyDeleteTriviallyDeadInstructions(DeadInsts, TLI);
-  
+
 #ifdef EXPENSIVE_CHECKS
   // If we could guarantee that this call is not extremely slow, we could
   // remove the ifdef limitation (see PR47712).
@@ -3986,83 +4041,6 @@ static bool needToScheduleSingleInstruction(ArrayRef<Value *> VL) {
 }
 #endif
 
-/// Generates key/subkey pair for the given value to provide effective sorting
-/// of the values and better detection of the vectorizable values sequences. The
-/// keys/subkeys can be used for better sorting of the values themselves (keys)
-/// and in values subgroups (subkeys).
-static std::pair<size_t, size_t> generateKeySubkey(
-    Value *V, const TargetLibraryInfo *TLI,
-    function_ref<hash_code(size_t, LoadInst *)> LoadsSubkeyGenerator,
-    bool AllowAlternate) {
-  hash_code Key = hash_value(V->getValueID() + 2);
-  hash_code SubKey = hash_value(0);
-  // Sort the loads by the distance between the pointers.
-  if (auto *LI = dyn_cast<LoadInst>(V)) {
-    Key = hash_combine(hash_value(LI->getParent()), Key);
-    if (LI->isSimple())
-      SubKey = hash_value(LoadsSubkeyGenerator(Key, LI));
-    else
-      SubKey = hash_value(LI);
-  } else if (isVectorLikeInstWithConstOps(V)) {
-    // Sort extracts by the vector operands.
-    if (isa<ExtractElementInst, UndefValue>(V))
-      Key = hash_value(Value::UndefValueVal + 1);
-    if (auto *EI = dyn_cast<ExtractElementInst>(V)) {
-      if (!isUndefVector(EI->getVectorOperand()) &&
-          !isa<UndefValue>(EI->getIndexOperand()))
-        SubKey = hash_value(EI->getVectorOperand());
-    }
-  } else if (auto *I = dyn_cast<Instruction>(V)) {
-    // Sort other instructions just by the opcodes except for CMPInst.
-    // For CMP also sort by the predicate kind.
-    if ((isa<BinaryOperator>(I) || isa<CastInst>(I)) &&
-        isValidForAlternation(I->getOpcode())) {
-      if (AllowAlternate)
-        Key = hash_value(isa<BinaryOperator>(I) ? 1 : 0);
-      else
-        Key = hash_combine(hash_value(I->getOpcode()), Key);
-      SubKey = hash_combine(
-          hash_value(I->getOpcode()), hash_value(I->getType()),
-          hash_value(isa<BinaryOperator>(I)
-                         ? I->getType()
-                         : cast<CastInst>(I)->getOperand(0)->getType()));
-    } else if (auto *CI = dyn_cast<CmpInst>(I)) {
-      CmpInst::Predicate Pred = CI->getPredicate();
-      if (CI->isCommutative())
-        Pred = std::min(Pred, CmpInst::getInversePredicate(Pred));
-      CmpInst::Predicate SwapPred = CmpInst::getSwappedPredicate(Pred);
-      SubKey = hash_combine(hash_value(I->getOpcode()), hash_value(Pred),
-                            hash_value(SwapPred),
-                            hash_value(CI->getOperand(0)->getType()));
-    } else if (auto *Call = dyn_cast<CallInst>(I)) {
-      Intrinsic::ID ID = getVectorIntrinsicIDForCall(Call, TLI);
-      if (isTriviallyVectorizable(ID))
-        SubKey = hash_combine(hash_value(I->getOpcode()), hash_value(ID));
-      else if (!VFDatabase(*Call).getMappings(*Call).empty())
-        SubKey = hash_combine(hash_value(I->getOpcode()),
-                              hash_value(Call->getCalledFunction()));
-      else
-        SubKey = hash_combine(hash_value(I->getOpcode()), hash_value(Call));
-      for (const CallBase::BundleOpInfo &Op : Call->bundle_op_infos())
-        SubKey = hash_combine(hash_value(Op.Begin), hash_value(Op.End),
-                              hash_value(Op.Tag), SubKey);
-    } else if (auto *Gep = dyn_cast<GetElementPtrInst>(I)) {
-      if (Gep->getNumOperands() == 2 && isa<ConstantInt>(Gep->getOperand(1)))
-        SubKey = hash_value(Gep->getPointerOperand());
-      else
-        SubKey = hash_value(Gep);
-    } else if (BinaryOperator::isIntDivRem(I->getOpcode()) &&
-               !isa<ConstantInt>(I->getOperand(1))) {
-      // Do not try to vectorize instructions with potentially high cost.
-      SubKey = hash_value(I);
-    } else {
-      SubKey = hash_value(I->getOpcode());
-    }
-    Key = hash_combine(hash_value(I->getParent()), Key);
-  }
-  return std::make_pair(Key, SubKey);
-}
-
 void BoUpSLP::buildTree_rec(ArrayRef<Value *> VL, unsigned Depth,
                             const EdgeInfo &UserTreeIdx) {
   assert((allConstant(VL) || allSameType(VL)) && "Invalid types!");
@@ -4764,7 +4742,7 @@ void BoUpSLP::buildTree_rec(ArrayRef<Value *> VL, unsigned Depth,
       unsigned NumArgs = CI->arg_size();
       SmallVector<Value*, 4> ScalarArgs(NumArgs, nullptr);
       for (unsigned j = 0; j != NumArgs; ++j)
-        if (hasVectorInstrinsicScalarOpd(ID, j))
+        if (hasVectorIntrinsicScalarOpd(ID, j))
           ScalarArgs[j] = CI->getArgOperand(j);
       for (Value *V : VL) {
         CallInst *CI2 = dyn_cast<CallInst>(V);
@@ -4783,7 +4761,7 @@ void BoUpSLP::buildTree_rec(ArrayRef<Value *> VL, unsigned Depth,
         // Some intrinsics have scalar arguments and should be same in order for
         // them to be vectorized.
         for (unsigned j = 0; j != NumArgs; ++j) {
-          if (hasVectorInstrinsicScalarOpd(ID, j)) {
+          if (hasVectorIntrinsicScalarOpd(ID, j)) {
             Value *A1J = CI2->getArgOperand(j);
             if (ScalarArgs[j] != A1J) {
               BS.cancelScheduling(VL, VL0);
@@ -4816,7 +4794,7 @@ void BoUpSLP::buildTree_rec(ArrayRef<Value *> VL, unsigned Depth,
       for (unsigned i = 0, e = CI->arg_size(); i != e; ++i) {
         // For scalar operands no need to to create an entry since no need to
         // vectorize it.
-        if (hasVectorInstrinsicScalarOpd(ID, i))
+        if (hasVectorIntrinsicScalarOpd(ID, i))
           continue;
         ValueList Operands;
         // Prepare the operand vector.
@@ -5081,6 +5059,7 @@ computeExtractCost(ArrayRef<Value *> VL, FixedVectorType *VecTy,
   // Process extracts in blocks of EltsPerVector to check if the source vector
   // operand can be re-used directly. If not, add the cost of creating a shuffle
   // to extract the values into a vector register.
+  SmallVector<int> RegMask(EltsPerVector, UndefMaskElem);
   for (auto *V : VL) {
     ++Idx;
 
@@ -5090,6 +5069,7 @@ computeExtractCost(ArrayRef<Value *> VL, FixedVectorType *VecTy,
 
     // Reached the start of a new vector registers.
     if (Idx % EltsPerVector == 0) {
+      RegMask.assign(EltsPerVector, UndefMaskElem);
       AllConsecutive = true;
       continue;
     }
@@ -5101,6 +5081,7 @@ computeExtractCost(ArrayRef<Value *> VL, FixedVectorType *VecTy,
       unsigned PrevIdx = *getExtractIndex(cast<Instruction>(VL[Idx - 1]));
       AllConsecutive &= PrevIdx + 1 == CurrentIdx &&
                         CurrentIdx % EltsPerVector == Idx % EltsPerVector;
+      RegMask[Idx % EltsPerVector] = CurrentIdx % EltsPerVector;
     }
 
     if (AllConsecutive)
@@ -5112,10 +5093,10 @@ computeExtractCost(ArrayRef<Value *> VL, FixedVectorType *VecTy,
 
     // If we have a series of extracts which are not consecutive and hence
     // cannot re-use the source vector register directly, compute the shuffle
-    // cost to extract the a vector with EltsPerVector elements.
+    // cost to extract the vector with EltsPerVector elements.
     Cost += TTI.getShuffleCost(
         TargetTransformInfo::SK_PermuteSingleSrc,
-        FixedVectorType::get(VecTy->getElementType(), EltsPerVector));
+        FixedVectorType::get(VecTy->getElementType(), EltsPerVector), RegMask);
   }
   return Cost;
 }
@@ -5350,7 +5331,7 @@ InstructionCost BoUpSLP::getEntryCost(const TreeEntry *E,
              "No reused scalars expected for broadcast.");
       return TTI->getShuffleCost(TargetTransformInfo::SK_Broadcast, VecTy,
                                  /*Mask=*/None, /*Index=*/0,
-                                 /*SubTp=*/nullptr, /*Args=*/VL);
+                                 /*SubTp=*/nullptr, /*Args=*/VL[0]);
     }
     InstructionCost ReuseShuffleCost = 0;
     if (NeedToShuffleReuses)
@@ -5902,16 +5883,21 @@ InstructionCost BoUpSLP::getEntryCost(const TreeEntry *E,
                                          TTI::CastContextHint::None, CostKind);
       }
 
-      SmallVector<int> Mask;
-      buildShuffleEntryMask(
-          E->Scalars, E->ReorderIndices, E->ReuseShuffleIndices,
-          [E](Instruction *I) {
-            assert(E->isOpcodeOrAlt(I) && "Unexpected main/alternate opcode");
-            return isAlternateInstruction(I, E->getMainOp(), E->getAltOp());
-          },
-          Mask);
-      CommonCost =
-          TTI->getShuffleCost(TargetTransformInfo::SK_Select, FinalVecTy, Mask);
+      if (E->ReuseShuffleIndices.empty()) {
+        CommonCost =
+            TTI->getShuffleCost(TargetTransformInfo::SK_Select, FinalVecTy);
+      } else {
+        SmallVector<int> Mask;
+        buildShuffleEntryMask(
+            E->Scalars, E->ReorderIndices, E->ReuseShuffleIndices,
+            [E](Instruction *I) {
+              assert(E->isOpcodeOrAlt(I) && "Unexpected main/alternate opcode");
+              return I->getOpcode() == E->getAltOpcode();
+            },
+            Mask);
+        CommonCost = TTI->getShuffleCost(TargetTransformInfo::SK_PermuteTwoSrc,
+                                         FinalVecTy, Mask);
+      }
       LLVM_DEBUG(dumpTreeCosts(E, CommonCost, VecCost, ScalarCost));
       return CommonCost + VecCost - ScalarCost;
     }
@@ -6300,7 +6286,8 @@ InstructionCost BoUpSLP::getTreeCost(ArrayRef<Value *> VectorizedVals) {
   Cost += SpillCost + ExtractCost;
   if (FirstUsers.size() == 1) {
     int Limit = ShuffleMask.front().size() * 2;
-    if (all_of(ShuffleMask.front(), [Limit](int Idx) { return Idx < Limit; }) &&
+    if (!all_of(ShuffleMask.front(),
+                [Limit](int Idx) { return Idx < Limit; }) ||
         !ShuffleVectorInst::isIdentityMask(ShuffleMask.front())) {
       InstructionCost C = TTI->getShuffleCost(
           TTI::SK_PermuteSingleSrc,
@@ -6349,6 +6336,8 @@ InstructionCost BoUpSLP::getTreeCost(ArrayRef<Value *> VectorizedVals) {
                       << "SLP: Current total cost = " << Cost << "\n");
     Cost -= InsertCost;
     for (int I = 2, E = FirstUsers.size(); I < E; ++I) {
+      if (ShuffleMask[I].empty())
+        continue;
       // Other elements - permutation of 2 vectors (the initial one and the
       // next Ith incoming vector).
       unsigned VF = ShuffleMask[I].size();
@@ -6468,12 +6457,6 @@ BoUpSLP::isGatherShuffledEntry(const TreeEntry *TE, SmallVectorImpl<int> &Mask,
       }
       UsedValuesEntry.try_emplace(V, Idx);
     }
-  }
-
-  if (UsedTEs.empty()) {
-    assert(all_of(TE->Scalars, UndefValue::classof) &&
-           "Expected vector of undefs only.");
-    return None;
   }
 
   unsigned VF = 0;
@@ -7375,11 +7358,11 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {
         ValueList OpVL;
         // Some intrinsics have scalar arguments. This argument should not be
         // vectorized.
-        if (UseIntrinsic && hasVectorInstrinsicScalarOpd(IID, j)) {
+        if (UseIntrinsic && hasVectorIntrinsicScalarOpd(IID, j)) {
           CallInst *CEI = cast<CallInst>(VL0);
           ScalarArg = CEI->getArgOperand(j);
           OpVecs.push_back(CEI->getArgOperand(j));
-          if (hasVectorInstrinsicOverloadedScalarOpd(IID, j))
+          if (hasVectorIntrinsicOverloadedScalarOpd(IID, j))
             TysForDecl.push_back(ScalarArg->getType());
           continue;
         }
@@ -9210,7 +9193,8 @@ bool SLPVectorizerPass::tryToVectorize(Instruction *I, BoUpSLP &R) {
   if (!I)
     return false;
 
-  if (!isa<BinaryOperator>(I) && !isa<CmpInst>(I))
+  if ((!isa<BinaryOperator>(I) && !isa<CmpInst>(I)) ||
+      isa<VectorType>(I->getType()))
     return false;
 
   Value *P = I->getParent();
@@ -9221,32 +9205,40 @@ bool SLPVectorizerPass::tryToVectorize(Instruction *I, BoUpSLP &R) {
   if (!Op0 || !Op1 || Op0->getParent() != P || Op1->getParent() != P)
     return false;
 
-  // Try to vectorize V.
-  if (tryToVectorizePair(Op0, Op1, R))
-    return true;
+  // First collect all possible candidates
+  SmallVector<std::pair<Value *, Value *>, 4> Candidates;
+  Candidates.emplace_back(Op0, Op1);
 
   auto *A = dyn_cast<BinaryOperator>(Op0);
   auto *B = dyn_cast<BinaryOperator>(Op1);
   // Try to skip B.
-  if (B && B->hasOneUse()) {
+  if (A && B && B->hasOneUse()) {
     auto *B0 = dyn_cast<BinaryOperator>(B->getOperand(0));
     auto *B1 = dyn_cast<BinaryOperator>(B->getOperand(1));
-    if (B0 && B0->getParent() == P && tryToVectorizePair(A, B0, R))
-      return true;
-    if (B1 && B1->getParent() == P && tryToVectorizePair(A, B1, R))
-      return true;
+    if (B0 && B0->getParent() == P)
+      Candidates.emplace_back(A, B0);
+    if (B1 && B1->getParent() == P)
+      Candidates.emplace_back(A, B1);
   }
-
   // Try to skip A.
-  if (A && A->hasOneUse()) {
+  if (B && A && A->hasOneUse()) {
     auto *A0 = dyn_cast<BinaryOperator>(A->getOperand(0));
     auto *A1 = dyn_cast<BinaryOperator>(A->getOperand(1));
-    if (A0 && A0->getParent() == P && tryToVectorizePair(A0, B, R))
-      return true;
-    if (A1 && A1->getParent() == P && tryToVectorizePair(A1, B, R))
-      return true;
+    if (A0 && A0->getParent() == P)
+      Candidates.emplace_back(A0, B);
+    if (A1 && A1->getParent() == P)
+      Candidates.emplace_back(A1, B);
   }
-  return false;
+
+  if (Candidates.size() == 1)
+    return tryToVectorizePair(Op0, Op1, R);
+
+  // We have multiple options. Try to pick the single best.
+  Optional<int> BestCandidate = R.findBestRootPair(Candidates);
+  if (!BestCandidate)
+    return false;
+  return tryToVectorizePair(Candidates[*BestCandidate].first,
+                            Candidates[*BestCandidate].second, R);
 }
 
 namespace {
@@ -9281,15 +9273,14 @@ class HorizontalReduction {
   using ReductionOpsType = SmallVector<Value *, 16>;
   using ReductionOpsListType = SmallVector<ReductionOpsType, 2>;
   ReductionOpsListType ReductionOps;
-  /// List of possibly reduced values.
-  SmallVector<SmallVector<Value *>> ReducedVals;
-  /// Maps reduced value to the corresponding reduction operation.
-  DenseMap<Value *, Instruction *> ReducedValsToOps;
+  SmallVector<Value *, 32> ReducedVals;
   // Use map vector to make stable output.
   MapVector<Instruction *, Value *> ExtraArgs;
   WeakTrackingVH ReductionRoot;
   /// The type of reduction operation.
   RecurKind RdxKind;
+
+  const unsigned INVALID_OPERAND_INDEX = std::numeric_limits<unsigned>::max();
 
   static bool isCmpSelMinMax(Instruction *I) {
     return match(I, m_Select(m_Cmp(), m_Value(), m_Value())) &&
@@ -9332,6 +9323,26 @@ class HorizontalReduction {
     if (getRdxKind(I) == RecurKind::Or && isa<SelectInst>(I) && Index == 1)
       return I->getOperand(2);
     return I->getOperand(Index);
+  }
+
+  /// Checks if the ParentStackElem.first should be marked as a reduction
+  /// operation with an extra argument or as extra argument itself.
+  void markExtraArg(std::pair<Instruction *, unsigned> &ParentStackElem,
+                    Value *ExtraArg) {
+    if (ExtraArgs.count(ParentStackElem.first)) {
+      ExtraArgs[ParentStackElem.first] = nullptr;
+      // We ran into something like:
+      // ParentStackElem.first = ExtraArgs[ParentStackElem.first] + ExtraArg.
+      // The whole ParentStackElem.first should be considered as an extra value
+      // in this case.
+      // Do not perform analysis of remaining operands of ParentStackElem.first
+      // instruction, this whole instruction is an extra argument.
+      ParentStackElem.second = INVALID_OPERAND_INDEX;
+    } else {
+      // We ran into something like:
+      // ParentStackElem.first += ... + ExtraArg + ...
+      ExtraArgs[ParentStackElem.first] = ExtraArg;
+    }
   }
 
   /// Creates reduction operation with the current opcode.
@@ -9418,7 +9429,7 @@ class HorizontalReduction {
   /// Creates reduction operation with the current opcode with the IR flags
   /// from \p I.
   static Value *createOp(IRBuilder<> &Builder, RecurKind RdxKind, Value *LHS,
-                         Value *RHS, const Twine &Name, Value *I) {
+                         Value *RHS, const Twine &Name, Instruction *I) {
     auto *SelI = dyn_cast<SelectInst>(I);
     Value *Op = createOp(Builder, RdxKind, LHS, RHS, Name, SelI != nullptr);
     if (SelI && RecurrenceDescriptor::isIntMinMaxRecurrenceKind(RdxKind)) {
@@ -9429,10 +9440,8 @@ class HorizontalReduction {
     return Op;
   }
 
-  static RecurKind getRdxKind(Value *V) {
-    auto *I = dyn_cast<Instruction>(V);
-    if (!I)
-      return RecurKind::None;
+  static RecurKind getRdxKind(Instruction *I) {
+    assert(I && "Expected instruction for reduction matching");
     if (match(I, m_Add(m_Value(), m_Value())))
       return RecurKind::Add;
     if (match(I, m_Mul(m_Value(), m_Value())))
@@ -9594,9 +9603,7 @@ public:
   HorizontalReduction() = default;
 
   /// Try to find a reduction tree.
-  bool matchAssociativeReduction(PHINode *Phi, Instruction *Inst,
-                                 ScalarEvolution &SE, const DataLayout &DL,
-                                 const TargetLibraryInfo &TLI) {
+  bool matchAssociativeReduction(PHINode *Phi, Instruction *Inst) {
     assert((!Phi || is_contained(Phi->operands(), Inst)) &&
            "Phi needs to use the binary operator");
     assert((isa<BinaryOperator>(Inst) || isa<SelectInst>(Inst) ||
@@ -9640,121 +9647,88 @@ public:
 
     ReductionRoot = Inst;
 
-    // Iterate through all the operands of the possible reduction tree and
-    // gather all the reduced values, sorting them by their value id.
-    BasicBlock *BB = Inst->getParent();
-    bool IsCmpSelMinMax = isCmpSelMinMax(Inst);
-    SmallVector<Instruction *> Worklist(1, Inst);
-    // Checks if the operands of the \p TreeN instruction are also reduction
-    // operations or should be treated as reduced values or an extra argument,
-    // which is not part of the reduction.
-    auto &&CheckOperands = [this, IsCmpSelMinMax,
-                            BB](Instruction *TreeN,
-                                SmallVectorImpl<Value *> &ExtraArgs,
-                                SmallVectorImpl<Value *> &PossibleReducedVals,
-                                SmallVectorImpl<Instruction *> &ReductionOps) {
-      for (int I = getFirstOperandIndex(TreeN),
-               End = getNumberOfOperands(TreeN);
-           I < End; ++I) {
-        Value *EdgeVal = getRdxOperand(TreeN, I);
-        ReducedValsToOps.try_emplace(EdgeVal, TreeN);
-        auto *EdgeInst = dyn_cast<Instruction>(EdgeVal);
-        // Edge has wrong parent - mark as an extra argument.
-        if (EdgeInst && !isVectorLikeInstWithConstOps(EdgeInst) &&
-            !hasSameParent(EdgeInst, BB)) {
-          ExtraArgs.push_back(EdgeVal);
-          continue;
-        }
-        // If the edge is not an instruction, or it is different from the main
-        // reduction opcode or has too many uses - possible reduced value.
-        if (!EdgeInst || getRdxKind(EdgeInst) != RdxKind ||
-            !hasRequiredNumberOfUses(IsCmpSelMinMax, EdgeInst) ||
-            !isVectorizable(getRdxKind(EdgeInst), EdgeInst)) {
-          PossibleReducedVals.push_back(EdgeVal);
-          continue;
-        }
-        ReductionOps.push_back(EdgeInst);
-      }
-    };
-    // Try to regroup reduced values so that it gets more profitable to try to
-    // reduce them. Values are grouped by their value ids, instructions - by
-    // instruction op id and/or alternate op id, plus do extra analysis for
-    // loads (grouping them by the distabce between pointers) and cmp
-    // instructions (grouping them by the predicate).
-    MapVector<size_t, MapVector<size_t, SmallVector<Value *>>>
-        PossibleReducedVals;
+    // The opcode for leaf values that we perform a reduction on.
+    // For example: load(x) + load(y) + load(z) + fptoui(w)
+    // The leaf opcode for 'w' does not match, so we don't include it as a
+    // potential candidate for the reduction.
+    unsigned LeafOpcode = 0;
+
+    // Post-order traverse the reduction tree starting at Inst. We only handle
+    // true trees containing binary operators or selects.
+    SmallVector<std::pair<Instruction *, unsigned>, 32> Stack;
+    Stack.push_back(std::make_pair(Inst, getFirstOperandIndex(Inst)));
     initReductionOps(Inst);
-    while (!Worklist.empty()) {
-      Instruction *TreeN = Worklist.pop_back_val();
-      SmallVector<Value *> Args;
-      SmallVector<Value *> PossibleRedVals;
-      SmallVector<Instruction *> PossibleReductionOps;
-      CheckOperands(TreeN, Args, PossibleRedVals, PossibleReductionOps);
-      // If too many extra args - mark the instruction itself as a reduction
-      // value, not a reduction operation.
-      if (Args.size() < 2) {
-        addReductionOps(TreeN);
-        // Add extra args.
-        if (!Args.empty()) {
-          assert(Args.size() == 1 && "Expected only single argument.");
-          ExtraArgs[TreeN] = Args.front();
+    while (!Stack.empty()) {
+      Instruction *TreeN = Stack.back().first;
+      unsigned EdgeToVisit = Stack.back().second++;
+      const RecurKind TreeRdxKind = getRdxKind(TreeN);
+      bool IsReducedValue = TreeRdxKind != RdxKind;
+
+      // Postorder visit.
+      if (IsReducedValue || EdgeToVisit >= getNumberOfOperands(TreeN)) {
+        if (IsReducedValue)
+          ReducedVals.push_back(TreeN);
+        else {
+          auto ExtraArgsIter = ExtraArgs.find(TreeN);
+          if (ExtraArgsIter != ExtraArgs.end() && !ExtraArgsIter->second) {
+            // Check if TreeN is an extra argument of its parent operation.
+            if (Stack.size() <= 1) {
+              // TreeN can't be an extra argument as it is a root reduction
+              // operation.
+              return false;
+            }
+            // Yes, TreeN is an extra argument, do not add it to a list of
+            // reduction operations.
+            // Stack[Stack.size() - 2] always points to the parent operation.
+            markExtraArg(Stack[Stack.size() - 2], TreeN);
+            ExtraArgs.erase(TreeN);
+          } else
+            addReductionOps(TreeN);
         }
-        // Add reduction values. The values are sorted for better vectorization
-        // results.
-        for (Value *V : PossibleRedVals) {
-          size_t Key, Idx;
-          std::tie(Key, Idx) = generateKeySubkey(
-              V, &TLI,
-              [&PossibleReducedVals, &DL, &SE](size_t Key, LoadInst *LI) {
-                for (const auto &LoadData : PossibleReducedVals[Key]) {
-                  auto *RLI = cast<LoadInst>(LoadData.second.front());
-                  if (getPointersDiff(RLI->getType(), RLI->getPointerOperand(),
-                                      LI->getType(), LI->getPointerOperand(),
-                                      DL, SE, /*StrictCheck=*/true))
-                    return hash_value(RLI->getPointerOperand());
-                }
-                return hash_value(LI->getPointerOperand());
-              },
-              /*AllowAlternate=*/false);
-          PossibleReducedVals[Key][Idx].push_back(V);
-        }
-        Worklist.append(PossibleReductionOps.begin(),
-                        PossibleReductionOps.end());
-      } else {
-        size_t Key, Idx;
-        std::tie(Key, Idx) = generateKeySubkey(
-            TreeN, &TLI,
-            [&PossibleReducedVals, &DL, &SE](size_t Key, LoadInst *LI) {
-              for (const auto &LoadData : PossibleReducedVals[Key]) {
-                auto *RLI = cast<LoadInst>(LoadData.second.front());
-                if (getPointersDiff(RLI->getType(), RLI->getPointerOperand(),
-                                    LI->getType(), LI->getPointerOperand(), DL,
-                                    SE, /*StrictCheck=*/true))
-                  return hash_value(RLI->getPointerOperand());
-              }
-              return hash_value(LI->getPointerOperand());
-            },
-            /*AllowAlternate=*/false);
-        PossibleReducedVals[Key][Idx].push_back(TreeN);
+        // Retract.
+        Stack.pop_back();
+        continue;
       }
+
+      // Visit operands.
+      Value *EdgeVal = getRdxOperand(TreeN, EdgeToVisit);
+      auto *EdgeInst = dyn_cast<Instruction>(EdgeVal);
+      if (!EdgeInst) {
+        // Edge value is not a reduction instruction or a leaf instruction.
+        // (It may be a constant, function argument, or something else.)
+        markExtraArg(Stack.back(), EdgeVal);
+        continue;
+      }
+      RecurKind EdgeRdxKind = getRdxKind(EdgeInst);
+      // Continue analysis if the next operand is a reduction operation or
+      // (possibly) a leaf value. If the leaf value opcode is not set,
+      // the first met operation != reduction operation is considered as the
+      // leaf opcode.
+      // Only handle trees in the current basic block.
+      // Each tree node needs to have minimal number of users except for the
+      // ultimate reduction.
+      const bool IsRdxInst = EdgeRdxKind == RdxKind;
+      if (EdgeInst != Phi && EdgeInst != Inst &&
+          hasSameParent(EdgeInst, Inst->getParent()) &&
+          hasRequiredNumberOfUses(isCmpSelMinMax(Inst), EdgeInst) &&
+          (!LeafOpcode || LeafOpcode == EdgeInst->getOpcode() || IsRdxInst)) {
+        if (IsRdxInst) {
+          // We need to be able to reassociate the reduction operations.
+          if (!isVectorizable(EdgeRdxKind, EdgeInst)) {
+            // I is an extra argument for TreeN (its parent operation).
+            markExtraArg(Stack.back(), EdgeInst);
+            continue;
+          }
+        } else if (!LeafOpcode) {
+          LeafOpcode = EdgeInst->getOpcode();
+        }
+        Stack.push_back(
+            std::make_pair(EdgeInst, getFirstOperandIndex(EdgeInst)));
+        continue;
+      }
+      // I is an extra argument for TreeN (its parent operation).
+      markExtraArg(Stack.back(), EdgeInst);
     }
-    auto PossibleReducedValsVect = PossibleReducedVals.takeVector();
-    // Sort values by the total number of values kinds to start the reduction
-    // from the longest possible reduced values sequences.
-    for (auto &PossibleReducedVals : PossibleReducedValsVect) {
-      auto PossibleRedVals = PossibleReducedVals.second.takeVector();
-      stable_sort(PossibleRedVals, [](const auto &P1, const auto &P2) {
-        return P1.second.size() > P2.second.size();
-      });
-      ReducedVals.emplace_back();
-      for (auto &Data : PossibleRedVals)
-        ReducedVals.back().append(Data.second.rbegin(), Data.second.rend());
-    }
-    // Sort the reduced values by number of same/alternate opcode and/or pointer
-    // operand.
-    stable_sort(ReducedVals, [](ArrayRef<Value *> P1, ArrayRef<Value *> P2) {
-      return P1.size() > P2.size();
-    });
     return true;
   }
 
@@ -9763,29 +9737,34 @@ public:
     // If there are a sufficient number of reduction values, reduce
     // to a nearby power-of-2. We can safely generate oversized
     // vectors and rely on the backend to split them to legal sizes.
-    unsigned NumReducedVals = std::accumulate(
-        ReducedVals.begin(), ReducedVals.end(), 0,
-        [](int Num, ArrayRef<Value *> Vals) { return Num + Vals.size(); });
+    unsigned NumReducedVals = ReducedVals.size();
     if (NumReducedVals < 4)
       return nullptr;
 
-    IRBuilder<> Builder(cast<Instruction>(ReductionRoot));
+    // Intersect the fast-math-flags from all reduction operations.
+    FastMathFlags RdxFMF;
+    RdxFMF.set();
+    for (ReductionOpsType &RdxOp : ReductionOps) {
+      for (Value *RdxVal : RdxOp) {
+        if (auto *FPMO = dyn_cast<FPMathOperator>(RdxVal))
+          RdxFMF &= FPMO->getFastMathFlags();
+      }
+    }
 
-    // Track the reduced values in case if they are replaced by extractelement
-    // because of the vectorization.
-    DenseMap<Value *, WeakTrackingVH> TrackedVals;
+    IRBuilder<> Builder(cast<Instruction>(ReductionRoot));
+    Builder.setFastMathFlags(RdxFMF);
+
     BoUpSLP::ExtraValueToDebugLocsMap ExternallyUsedValues;
     // The same extra argument may be used several times, so log each attempt
     // to use it.
     for (const std::pair<Instruction *, Value *> &Pair : ExtraArgs) {
       assert(Pair.first && "DebugLoc must be set.");
       ExternallyUsedValues[Pair.second].push_back(Pair.first);
-      TrackedVals.try_emplace(Pair.second, Pair.second);
     }
 
     // The compare instruction of a min/max is the insertion point for new
     // instructions and may be replaced with a new compare instruction.
-    auto &&GetCmpForMinMaxReduction = [](Instruction *RdxRootInst) {
+    auto getCmpForMinMaxReduction = [](Instruction *RdxRootInst) {
       assert(isa<SelectInst>(RdxRootInst) &&
              "Expected min/max reduction to have select root instruction");
       Value *ScalarCond = cast<SelectInst>(RdxRootInst)->getCondition();
@@ -9797,246 +9776,141 @@ public:
     // The reduction root is used as the insertion point for new instructions,
     // so set it as externally used to prevent it from being deleted.
     ExternallyUsedValues[ReductionRoot];
-    SmallVector<Value *> IgnoreList;
-    for (ReductionOpsType &RdxOps : ReductionOps)
-      for (Value *RdxOp : RdxOps) {
-        if (!RdxOp)
-          continue;
-        IgnoreList.push_back(RdxOp);
+    SmallVector<Value *, 16> IgnoreList;
+    for (ReductionOpsType &RdxOp : ReductionOps)
+      IgnoreList.append(RdxOp.begin(), RdxOp.end());
+
+    unsigned ReduxWidth = PowerOf2Floor(NumReducedVals);
+    if (NumReducedVals > ReduxWidth) {
+      // In the loop below, we are building a tree based on a window of
+      // 'ReduxWidth' values.
+      // If the operands of those values have common traits (compare predicate,
+      // constant operand, etc), then we want to group those together to
+      // minimize the cost of the reduction.
+
+      // TODO: This should be extended to count common operands for
+      //       compares and binops.
+
+      // Step 1: Count the number of times each compare predicate occurs.
+      SmallDenseMap<unsigned, unsigned> PredCountMap;
+      for (Value *RdxVal : ReducedVals) {
+        CmpInst::Predicate Pred;
+        if (match(RdxVal, m_Cmp(Pred, m_Value(), m_Value())))
+          ++PredCountMap[Pred];
       }
-
-    // Need to track reduced vals, they may be changed during vectorization of
-    // subvectors.
-    for (ArrayRef<Value *> Candidates : ReducedVals)
-      for (Value *V : Candidates)
-        TrackedVals.try_emplace(V, V);
-
-    DenseMap<Value *, unsigned> VectorizedVals;
-    Value *VectorizedTree = nullptr;
-    // Try to vectorize elements based on their type.
-    for (unsigned I = 0, E = ReducedVals.size(); I < E; ++I) {
-      ArrayRef<Value *> OrigReducedVals = ReducedVals[I];
-      InstructionsState S = getSameOpcode(OrigReducedVals);
-      SmallVector<Value *> Candidates;
-      DenseMap<Value *, Value *> TrackedToOrig;
-      for (unsigned Cnt = 0, Sz = OrigReducedVals.size(); Cnt < Sz; ++Cnt) {
-        Value *RdxVal = TrackedVals.find(OrigReducedVals[Cnt])->second;
-        // Check if the reduction value was not overriden by the extractelement
-        // instruction because of the vectorization and exclude it, if it is not
-        // compatible with other values.
-        if (auto *Inst = dyn_cast<Instruction>(RdxVal))
-          if (isVectorLikeInstWithConstOps(Inst) &&
-              (!S.getOpcode() || !S.isOpcodeOrAlt(Inst)))
-            continue;
-        Candidates.push_back(RdxVal);
-        TrackedToOrig.try_emplace(RdxVal, OrigReducedVals[Cnt]);
-      }
-      bool ShuffledExtracts = false;
-      // Try to handle shuffled extractelements.
-      if (S.getOpcode() == Instruction::ExtractElement && !S.isAltShuffle() &&
-          I + 1 < E) {
-        InstructionsState NextS = getSameOpcode(ReducedVals[I + 1]);
-        if (NextS.getOpcode() == Instruction::ExtractElement &&
-            !NextS.isAltShuffle()) {
-          SmallVector<Value *> CommonCandidates(Candidates);
-          for (Value *RV : ReducedVals[I + 1]) {
-            Value *RdxVal = TrackedVals.find(RV)->second;
-            // Check if the reduction value was not overriden by the
-            // extractelement instruction because of the vectorization and
-            // exclude it, if it is not compatible with other values.
-            if (auto *Inst = dyn_cast<Instruction>(RdxVal))
-              if (!NextS.getOpcode() || !NextS.isOpcodeOrAlt(Inst))
-                continue;
-            CommonCandidates.push_back(RdxVal);
-            TrackedToOrig.try_emplace(RdxVal, RV);
-          }
-          SmallVector<int> Mask;
-          if (isFixedVectorShuffle(CommonCandidates, Mask)) {
-            ++I;
-            Candidates.swap(CommonCandidates);
-            ShuffledExtracts = true;
-          }
+      // Step 2: Sort the values so the most common predicates come first.
+      stable_sort(ReducedVals, [&PredCountMap](Value *A, Value *B) {
+        CmpInst::Predicate PredA, PredB;
+        if (match(A, m_Cmp(PredA, m_Value(), m_Value())) &&
+            match(B, m_Cmp(PredB, m_Value(), m_Value()))) {
+          return PredCountMap[PredA] > PredCountMap[PredB];
         }
-      }
-      unsigned NumReducedVals = Candidates.size();
-      if (NumReducedVals < 4)
-        continue;
-
-      unsigned ReduxWidth = PowerOf2Floor(NumReducedVals);
-      unsigned Start = 0;
-      unsigned Pos = Start;
-      // Restarts vectorization attempt with lower vector factor.
-      auto &&AdjustReducedVals = [&Pos, &Start, &ReduxWidth, NumReducedVals]() {
-        if (ReduxWidth == 4 || Pos >= NumReducedVals - ReduxWidth + 1) {
-          ++Start;
-          ReduxWidth = PowerOf2Floor(NumReducedVals - Start) * 2;
-        }
-        Pos = Start;
-        ReduxWidth /= 2;
-      };
-      while (Pos < NumReducedVals - ReduxWidth + 1 && ReduxWidth >= 4) {
-        ArrayRef<Value *> VL(std::next(Candidates.begin(), Pos), ReduxWidth);
-        V.buildTree(VL, IgnoreList);
-        if (V.isTreeTinyAndNotFullyVectorizable(/*ForReduction=*/true)) {
-          AdjustReducedVals();
-          continue;
-        }
-        if (V.isLoadCombineReductionCandidate(RdxKind)) {
-          AdjustReducedVals();
-          continue;
-        }
-        V.reorderTopToBottom();
-        // No need to reorder the root node at all.
-        V.reorderBottomToTop(/*IgnoreReorder=*/true);
-        // Keep extracted other reduction values, if they are used in the
-        // vectorization trees.
-        BoUpSLP::ExtraValueToDebugLocsMap LocalExternallyUsedValues(
-            ExternallyUsedValues);
-        for (unsigned Cnt = 0, Sz = ReducedVals.size(); Cnt < Sz; ++Cnt) {
-          if (Cnt == I || (ShuffledExtracts && Cnt == I - 1))
-            continue;
-          for_each(ReducedVals[Cnt],
-                   [&LocalExternallyUsedValues, &TrackedVals](Value *V) {
-                     if (isa<Instruction>(V))
-                       LocalExternallyUsedValues[TrackedVals[V]];
-                   });
-        }
-        for (unsigned Cnt = 0; Cnt < NumReducedVals; ++Cnt) {
-          if (Cnt >= Pos && Cnt < Pos + ReduxWidth)
-            continue;
-          if (VectorizedVals.count(Candidates[Cnt]))
-            continue;
-          LocalExternallyUsedValues[Candidates[Cnt]];
-        }
-        V.buildExternalUses(LocalExternallyUsedValues);
-
-        V.computeMinimumValueSizes();
-
-        // Intersect the fast-math-flags from all reduction operations.
-        FastMathFlags RdxFMF;
-        RdxFMF.set();
-        for (Value *RdxVal : VL) {
-          if (auto *FPMO = dyn_cast<FPMathOperator>(
-                  ReducedValsToOps.find(RdxVal)->second))
-            RdxFMF &= FPMO->getFastMathFlags();
-        }
-        // Estimate cost.
-        InstructionCost TreeCost = V.getTreeCost(VL);
-        InstructionCost ReductionCost =
-            getReductionCost(TTI, VL[0], ReduxWidth, RdxFMF);
-        InstructionCost Cost = TreeCost + ReductionCost;
-        if (!Cost.isValid()) {
-          LLVM_DEBUG(dbgs() << "Encountered invalid baseline cost.\n");
-          return nullptr;
-        }
-        if (Cost >= -SLPCostThreshold) {
-          V.getORE()->emit([&]() {
-            return OptimizationRemarkMissed(
-                       SV_NAME, "HorSLPNotBeneficial",
-                       ReducedValsToOps.find(VL[0])->second)
-                   << "Vectorizing horizontal reduction is possible"
-                   << "but not beneficial with cost " << ore::NV("Cost", Cost)
-                   << " and threshold "
-                   << ore::NV("Threshold", -SLPCostThreshold);
-          });
-          AdjustReducedVals();
-          continue;
-        }
-
-        LLVM_DEBUG(dbgs() << "SLP: Vectorizing horizontal reduction at cost:"
-                          << Cost << ". (HorRdx)\n");
-        V.getORE()->emit([&]() {
-          return OptimizationRemark(SV_NAME, "VectorizedHorizontalReduction",
-                                    ReducedValsToOps.find(VL[0])->second)
-                 << "Vectorized horizontal reduction with cost "
-                 << ore::NV("Cost", Cost) << " and with tree size "
-                 << ore::NV("TreeSize", V.getTreeSize());
-        });
-
-        Builder.setFastMathFlags(RdxFMF);
-
-        // Vectorize a tree.
-        Value *VectorizedRoot = V.vectorizeTree(LocalExternallyUsedValues);
-
-        // Emit a reduction. If the root is a select (min/max idiom), the insert
-        // point is the compare condition of that select.
-        Instruction *RdxRootInst = cast<Instruction>(ReductionRoot);
-        if (isCmpSelMinMax(RdxRootInst))
-          Builder.SetInsertPoint(GetCmpForMinMaxReduction(RdxRootInst));
-        else
-          Builder.SetInsertPoint(RdxRootInst);
-
-        // To prevent poison from leaking across what used to be sequential,
-        // safe, scalar boolean logic operations, the reduction operand must be
-        // frozen.
-        if (isa<SelectInst>(RdxRootInst) && isBoolLogicOp(RdxRootInst))
-          VectorizedRoot = Builder.CreateFreeze(VectorizedRoot);
-
-        Value *ReducedSubTree =
-            emitReduction(VectorizedRoot, Builder, ReduxWidth, TTI);
-
-        if (!VectorizedTree) {
-          // Initialize the final value in the reduction.
-          VectorizedTree = ReducedSubTree;
-        } else {
-          // Update the final value in the reduction.
-          Builder.SetCurrentDebugLocation(
-              cast<Instruction>(ReductionOps.front().front())->getDebugLoc());
-          VectorizedTree = createOp(Builder, RdxKind, VectorizedTree,
-                                    ReducedSubTree, "op.rdx", ReductionOps);
-        }
-        // Count vectorized reduced values to exclude them from final reduction.
-        for (Value *V : VL)
-          ++VectorizedVals.try_emplace(TrackedToOrig.find(V)->second, 0)
-                .first->getSecond();
-        Pos += ReduxWidth;
-        Start = Pos;
-        ReduxWidth = PowerOf2Floor(NumReducedVals - Pos);
-      }
+        return false;
+      });
     }
+
+    Value *VectorizedTree = nullptr;
+    unsigned i = 0;
+    while (i < NumReducedVals - ReduxWidth + 1 && ReduxWidth > 2) {
+      ArrayRef<Value *> VL(&ReducedVals[i], ReduxWidth);
+      V.buildTree(VL, IgnoreList);
+      if (V.isTreeTinyAndNotFullyVectorizable(/*ForReduction=*/true))
+        break;
+      if (V.isLoadCombineReductionCandidate(RdxKind))
+        break;
+      V.reorderTopToBottom();
+      V.reorderBottomToTop(/*IgnoreReorder=*/true);
+      V.buildExternalUses(ExternallyUsedValues);
+
+      // For a poison-safe boolean logic reduction, do not replace select
+      // instructions with logic ops. All reduced values will be frozen (see
+      // below) to prevent leaking poison.
+      if (isa<SelectInst>(ReductionRoot) &&
+          isBoolLogicOp(cast<Instruction>(ReductionRoot)) &&
+          NumReducedVals != ReduxWidth)
+        break;
+
+      V.computeMinimumValueSizes();
+
+      // Estimate cost.
+      InstructionCost TreeCost =
+          V.getTreeCost(makeArrayRef(&ReducedVals[i], ReduxWidth));
+      InstructionCost ReductionCost =
+          getReductionCost(TTI, ReducedVals[i], ReduxWidth, RdxFMF);
+      InstructionCost Cost = TreeCost + ReductionCost;
+      if (!Cost.isValid()) {
+        LLVM_DEBUG(dbgs() << "Encountered invalid baseline cost.\n");
+        return nullptr;
+      }
+      if (Cost >= -SLPCostThreshold) {
+        V.getORE()->emit([&]() {
+          return OptimizationRemarkMissed(SV_NAME, "HorSLPNotBeneficial",
+                                          cast<Instruction>(VL[0]))
+                 << "Vectorizing horizontal reduction is possible"
+                 << "but not beneficial with cost " << ore::NV("Cost", Cost)
+                 << " and threshold "
+                 << ore::NV("Threshold", -SLPCostThreshold);
+        });
+        break;
+      }
+
+      LLVM_DEBUG(dbgs() << "SLP: Vectorizing horizontal reduction at cost:"
+                        << Cost << ". (HorRdx)\n");
+      V.getORE()->emit([&]() {
+        return OptimizationRemark(SV_NAME, "VectorizedHorizontalReduction",
+                                  cast<Instruction>(VL[0]))
+               << "Vectorized horizontal reduction with cost "
+               << ore::NV("Cost", Cost) << " and with tree size "
+               << ore::NV("TreeSize", V.getTreeSize());
+      });
+
+      // Vectorize a tree.
+      DebugLoc Loc = cast<Instruction>(ReducedVals[i])->getDebugLoc();
+      Value *VectorizedRoot = V.vectorizeTree(ExternallyUsedValues);
+
+      // Emit a reduction. If the root is a select (min/max idiom), the insert
+      // point is the compare condition of that select.
+      Instruction *RdxRootInst = cast<Instruction>(ReductionRoot);
+      if (isCmpSelMinMax(RdxRootInst))
+        Builder.SetInsertPoint(getCmpForMinMaxReduction(RdxRootInst));
+      else
+        Builder.SetInsertPoint(RdxRootInst);
+
+      // To prevent poison from leaking across what used to be sequential, safe,
+      // scalar boolean logic operations, the reduction operand must be frozen.
+      if (isa<SelectInst>(RdxRootInst) && isBoolLogicOp(RdxRootInst))
+        VectorizedRoot = Builder.CreateFreeze(VectorizedRoot);
+
+      Value *ReducedSubTree =
+          emitReduction(VectorizedRoot, Builder, ReduxWidth, TTI);
+
+      if (!VectorizedTree) {
+        // Initialize the final value in the reduction.
+        VectorizedTree = ReducedSubTree;
+      } else {
+        // Update the final value in the reduction.
+        Builder.SetCurrentDebugLocation(Loc);
+        VectorizedTree = createOp(Builder, RdxKind, VectorizedTree,
+                                  ReducedSubTree, "op.rdx", ReductionOps);
+      }
+      i += ReduxWidth;
+      ReduxWidth = PowerOf2Floor(NumReducedVals - i);
+    }
+
     if (VectorizedTree) {
       // Finish the reduction.
-      // Need to add extra arguments and not vectorized possible reduction
-      // values.
-      for (unsigned I = 0, E = ReducedVals.size(); I < E; ++I) {
-        ArrayRef<Value *> Candidates = ReducedVals[I];
-        for (Value *RdxVal : Candidates) {
-          auto It = VectorizedVals.find(RdxVal);
-          if (It != VectorizedVals.end()) {
-            --It->getSecond();
-            if (It->second == 0)
-              VectorizedVals.erase(It);
-            continue;
-          }
-          Instruction *RedOp = ReducedValsToOps.find(RdxVal)->second;
-          Builder.SetCurrentDebugLocation(RedOp->getDebugLoc());
-          ReductionOpsListType Ops;
-          if (auto *Sel = dyn_cast<SelectInst>(RedOp))
-            Ops.emplace_back().push_back(Sel->getCondition());
-          Ops.emplace_back().push_back(RedOp);
-          Value *StableRdxVal = RdxVal;
-          auto TVIt = TrackedVals.find(RdxVal);
-          if (TVIt != TrackedVals.end())
-            StableRdxVal = TVIt->second;
-
-          VectorizedTree = createOp(Builder, RdxKind, VectorizedTree,
-                                    StableRdxVal, "op.rdx", RedOp);
-        }
+      for (; i < NumReducedVals; ++i) {
+        auto *I = cast<Instruction>(ReducedVals[i]);
+        Builder.SetCurrentDebugLocation(I->getDebugLoc());
+        VectorizedTree =
+            createOp(Builder, RdxKind, VectorizedTree, I, "", ReductionOps);
       }
       for (auto &Pair : ExternallyUsedValues) {
         // Add each externally used value to the final reduction.
         for (auto *I : Pair.second) {
           Builder.SetCurrentDebugLocation(I->getDebugLoc());
-          ReductionOpsListType Ops;
-          if (auto *Sel = dyn_cast<SelectInst>(I))
-            Ops.emplace_back().push_back(Sel->getCondition());
-          Ops.emplace_back().push_back(I);
-          Value *StableRdxVal = Pair.first;
-          auto TVIt = TrackedVals.find(Pair.first);
-          if (TVIt != TrackedVals.end())
-            StableRdxVal = TVIt->second;
           VectorizedTree = createOp(Builder, RdxKind, VectorizedTree,
-                                    StableRdxVal, "op.rdx", Ops);
+                                    Pair.first, "op.extra", I);
         }
       }
 
@@ -10327,8 +10201,7 @@ static bool matchRdxBop(Instruction *I, Value *&V0, Value *&V1) {
 /// performed.
 static bool tryToVectorizeHorReductionOrInstOperands(
     PHINode *P, Instruction *Root, BasicBlock *BB, BoUpSLP &R,
-    TargetTransformInfo *TTI, ScalarEvolution &SE, const DataLayout &DL,
-    const TargetLibraryInfo &TLI,
+    TargetTransformInfo *TTI,
     const function_ref<bool(Instruction *, BoUpSLP &)> Vectorize) {
   if (!ShouldVectorizeHor)
     return false;
@@ -10355,14 +10228,13 @@ static bool tryToVectorizeHorReductionOrInstOperands(
   SmallPtrSet<Value *, 8> VisitedInstrs;
   SmallVector<WeakTrackingVH> PostponedInsts;
   bool Res = false;
-  auto &&TryToReduce = [TTI, &SE, &DL, &P, &R, &TLI](Instruction *Inst,
-                                                     Value *&B0,
-                                                     Value *&B1) -> Value * {
+  auto &&TryToReduce = [TTI, &P, &R](Instruction *Inst, Value *&B0,
+                                     Value *&B1) -> Value * {
     bool IsBinop = matchRdxBop(Inst, B0, B1);
     bool IsSelect = match(Inst, m_Select(m_Value(), m_Value(), m_Value()));
     if (IsBinop || IsSelect) {
       HorizontalReduction HorRdx;
-      if (HorRdx.matchAssociativeReduction(P, Inst, SE, DL, TLI))
+      if (HorRdx.matchAssociativeReduction(P, Inst))
         return HorRdx.tryToReduce(R, TTI);
     }
     return nullptr;
@@ -10445,8 +10317,8 @@ bool SLPVectorizerPass::vectorizeRootInstruction(PHINode *P, Value *V,
   auto &&ExtraVectorization = [this](Instruction *I, BoUpSLP &R) -> bool {
     return tryToVectorize(I, R);
   };
-  return tryToVectorizeHorReductionOrInstOperands(P, I, BB, R, TTI, *SE, *DL,
-                                                  *TLI, ExtraVectorization);
+  return tryToVectorizeHorReductionOrInstOperands(P, I, BB, R, TTI,
+                                                  ExtraVectorization);
 }
 
 bool SLPVectorizerPass::vectorizeInsertValueInst(InsertValueInst *IVI,
@@ -11037,7 +10909,7 @@ bool SLPVectorizerPass::vectorizeStoreChains(BoUpSLP &R) {
         DomTreeNodeBase<llvm::BasicBlock> *NodeI2 =
             DT->getNode(I2->getParent());
         assert(NodeI1 && "Should only process reachable instructions");
-        assert(NodeI1 && "Should only process reachable instructions");
+        assert(NodeI2 && "Should only process reachable instructions");
         assert((NodeI1 == NodeI2) ==
                    (NodeI1->getDFSNumIn() == NodeI2->getDFSNumIn()) &&
                "Different nodes should have different DFS numbers");

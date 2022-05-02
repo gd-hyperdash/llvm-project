@@ -3336,6 +3336,14 @@ TEST_F(FormatTest, UnderstandsAccessSpecifiers) {
   verifyFormat("if (public == private)\n");
   verifyFormat("void foo(public, private)");
   verifyFormat("public::foo();");
+
+  verifyFormat("class A {\n"
+               "public:\n"
+               "  std::unique_ptr<int *[]> b() { return nullptr; }\n"
+               "\n"
+               "private:\n"
+               "  int c;\n"
+               "};");
 }
 
 TEST_F(FormatTest, SeparatesLogicalBlocks) {
@@ -9754,6 +9762,15 @@ TEST_F(FormatTest, UnderstandsUnaryOperators) {
   verifyFormat("if (!(a->f())) {\n}");
   verifyFormat("if (!+i) {\n}");
   verifyFormat("~&a;");
+  verifyFormat("for (x = 0; -10 < x; --x) {\n}");
+  verifyFormat("sizeof -x");
+  verifyFormat("sizeof +x");
+  verifyFormat("sizeof *x");
+  verifyFormat("sizeof &x");
+  verifyFormat("delete +x;");
+  verifyFormat("co_await +x;");
+  verifyFormat("case *x:");
+  verifyFormat("case &x:");
 
   verifyFormat("a-- > b;");
   verifyFormat("b ? -a : c;");
@@ -12773,6 +12790,14 @@ TEST_F(FormatTest, PullInlineFunctionDefinitionsIntoSingleLine) {
                "};",
                MergeInlineOnly);
 
+  verifyFormat("struct S {\n"
+               "// comment\n"
+               "#ifdef FOO\n"
+               "  int foo() { bar(); }\n"
+               "#endif\n"
+               "};",
+               MergeInlineOnly);
+
   // Also verify behavior when BraceWrapping.AfterFunction = true
   MergeInlineOnly.BreakBeforeBraces = FormatStyle::BS_Custom;
   MergeInlineOnly.BraceWrapping.AfterFunction = true;
@@ -13393,6 +13418,12 @@ TEST_F(FormatTest, MergeHandlingInTheFaceOfPreprocessorDirectives) {
                "    return 1;            \\\n"
                "  return 2;",
                ShortMergedIf);
+
+  verifyFormat("//\n"
+               "#define a \\\n"
+               "  if      \\\n"
+               "  0",
+               getChromiumStyle(FormatStyle::LK_Cpp));
 }
 
 TEST_F(FormatTest, FormatStarDependingOnContext) {
@@ -21464,6 +21495,7 @@ TEST_F(FormatTest, FormatsLambdas) {
                "  bar([]() {} // Did not respect SpacesBeforeTrailingComments\n"
                "  );\n"
                "}");
+  verifyFormat("auto k = *[](int *j) { return j; }(&i);");
 
   // Lambdas created through weird macros.
   verifyFormat("void f() {\n"

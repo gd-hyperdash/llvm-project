@@ -134,6 +134,10 @@ Changes to the OCaml bindings
 Changes to the C API
 --------------------
 
+* Add ``LLVMGetCastOpcode`` function to aid users of ``LLVMBuildCast`` in
+  resolving the best cast operation given a source value and destination type.
+  This function is a direct wrapper of ``CastInst::getCastOpcode``.
+
 Changes to the Go bindings
 --------------------------
 
@@ -160,6 +164,14 @@ Changes to LLDB
 
 Changes to Sanitizers
 ---------------------
+
+
+Other Changes
+-------------
+* The code for the `LLVM Visual Studio integration
+  <https://marketplace.visualstudio.com/items?itemName=LLVMExtensions.llvm-toolchain>`_
+  has been removed. This had been obsolete and abandoned since Visual Studio
+  started including an integration by default in 2019.
 
 External Open Source Projects Using LLVM 15
 ===========================================

@@ -99,8 +99,8 @@ def ParallelOp : OpenMP_Op<"parallel", [
     of the parallel region.
   }];
 
-  let arguments = (ins Optional<AnyType>:$if_expr_var,
-             Optional<AnyType>:$num_threads_var,
+  let arguments = (ins Optional<I1>:$if_expr_var,
+             Optional<IntLikeType>:$num_threads_var,
              Variadic<AnyType>:$allocate_vars,
              Variadic<AnyType>:$allocators_vars,
              Variadic<OpenMP_PointerLikeType>:$reduction_vars,
@@ -946,6 +946,7 @@ def AtomicCaptureOp : OpenMP_Op<"atomic.capture",
     $region attr-dict
   }];
   let hasRegionVerifier = 1;
+  let hasVerifier = 1;
   let extraClassDeclaration = [{
     /// Returns the first operation in atomic capture region
     Operation* getFirstOp();

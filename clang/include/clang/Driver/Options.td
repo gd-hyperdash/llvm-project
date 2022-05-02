@@ -812,9 +812,9 @@ def Xcuda_fatbinary : Separate<["-"], "Xcuda-fatbinary">,
   HelpText<"Pass <arg> to fatbinary invocation">, MetaVarName<"<arg>">;
 def Xcuda_ptxas : Separate<["-"], "Xcuda-ptxas">,
   HelpText<"Pass <arg> to the ptxas assembler">, MetaVarName<"<arg>">;
-def Xopenmp_target : Separate<["-"], "Xopenmp-target">,
+def Xopenmp_target : Separate<["-"], "Xopenmp-target">, Group<CompileOnly_Group>,
   HelpText<"Pass <arg> to the target offloading toolchain.">, MetaVarName<"<arg>">;
-def Xopenmp_target_EQ : JoinedAndSeparate<["-"], "Xopenmp-target=">,
+def Xopenmp_target_EQ : JoinedAndSeparate<["-"], "Xopenmp-target=">, Group<CompileOnly_Group>,
   HelpText<"Pass <arg> to the target offloading toolchain identified by <triple>.">,
   MetaVarName<"<triple> <arg>">;
 def z : Separate<["-"], "z">, Flags<[LinkerInput, RenderAsInput]>,
@@ -906,14 +906,6 @@ def fconvergent_functions : Flag<["-"], "fconvergent-functions">, Group<f_Group>
 def gpu_use_aux_triple_only : Flag<["--"], "gpu-use-aux-triple-only">,
   InternalDriverOpt, HelpText<"Prepare '-aux-triple' only without populating "
                               "'-aux-target-cpu' and '-aux-target-feature'.">;
-def cuda_device_only : Flag<["--"], "cuda-device-only">,
-  HelpText<"Compile CUDA code for device only">;
-def cuda_host_only : Flag<["--"], "cuda-host-only">,
-  HelpText<"Compile CUDA code for host only.  Has no effect on non-CUDA "
-           "compilations.">;
-def cuda_compile_host_device : Flag<["--"], "cuda-compile-host-device">,
-  HelpText<"Compile CUDA code for both host and device (default).  Has no "
-           "effect on non-CUDA compilations.">;
 def cuda_include_ptx_EQ : Joined<["--"], "cuda-include-ptx=">, Flags<[NoXarchOption]>,
   HelpText<"Include PTX for the following GPU architecture (e.g. sm_35) or 'all'. May be specified more than once.">;
 def no_cuda_include_ptx_EQ : Joined<["--"], "no-cuda-include-ptx=">, Flags<[NoXarchOption]>,
@@ -927,6 +919,8 @@ def cuda_gpu_arch_EQ : Joined<["--"], "cuda-gpu-arch=">, Flags<[NoXarchOption]>,
   Alias<offload_arch_EQ>;
 def hip_link : Flag<["--"], "hip-link">,
   HelpText<"Link clang-offload-bundler bundles for HIP">;
+def no_hip_rt: Flag<["-"], "no-hip-rt">,
+  HelpText<"Do not link against HIP runtime libraries">;
 def no_offload_arch_EQ : Joined<["--"], "no-offload-arch=">, Flags<[NoXarchOption]>,
   HelpText<"Remove CUDA/HIP offloading device architecture (e.g. sm_35, gfx906) from the list of devices to compile for. "
            "'all' resets the list to its default value.">;
@@ -1430,6 +1424,9 @@ def fdiagnostics_hotness_threshold_EQ : Joined<["-"], "fdiagnostics-hotness-thre
     Group<f_Group>, Flags<[CC1Option]>, MetaVarName<"<value>">,
     HelpText<"Prevent optimization remarks from being output if they do not have at least this profile count. "
     "Use 'auto' to apply the threshold from profile summary">;
+def fdiagnostics_misexpect_tolerance_EQ : Joined<["-"], "fdiagnostics-misexpect-tolerance=">,
+    Group<f_Group>, Flags<[CC1Option]>, MetaVarName<"<value>">,
+    HelpText<"Prevent misexpect diagnostics from being output if the profile counts are within N% of the expected. ">;
 defm diagnostics_show_option : BoolFOption<"diagnostics-show-option",
     DiagnosticOpts<"ShowOptionNames">, DefaultTrue,
     NegFlag<SetFalse, [CC1Option]>, PosFlag<SetTrue, [], "Print option name with mappable diagnostics">>;
@@ -2293,6 +2290,16 @@ defm implicit_modules : BoolFOption<"implicit-modules",
   NegFlag<SetFalse, [CC1Option]>, PosFlag<SetTrue>, BothFlags<[NoXarchOption,CoreOption]>>;
 def fretain_comments_from_system_headers : Flag<["-"], "fretain-comments-from-system-headers">, Group<f_Group>, Flags<[CC1Option]>,
   MarshallingInfoFlag<LangOpts<"RetainCommentsFromSystemHeaders">>;
+def fmodule_header : Flag <["-"], "fmodule-header">, Group<f_Group>,
+  Flags<[NoXarchOption]>, HelpText<"Build a C++20 Header Unit from a header.">;
+def fmodule_header_EQ : Joined<["-"], "fmodule-header=">, Group<f_Group>,
+  Flags<[NoXarchOption]>, MetaVarName<"<kind>">,
+  HelpText<"Build a C++20 Header Unit from a header that should be found in the user (fmodule-header=user) or system (fmodule-header=system) search path.">;
+
+def fno_knr_functions : Flag<["-"], "fno-knr-functions">, Group<f_Group>,
+  MarshallingInfoFlag<LangOpts<"DisableKNRFunctions">>,
+  HelpText<"Disable support for K&R C function declarations">,
+  Flags<[CC1Option, CoreOption]>;
 
 def fmudflapth : Flag<["-"], "fmudflapth">, Group<f_Group>;
 def fmudflap : Flag<["-"], "fmudflap">, Group<f_Group>;
@@ -2519,10 +2526,27 @@ defm openmp_optimistic_collapse : BoolFOption<"openmp-optimistic-collapse",
   PosFlag<SetTrue, [CC1Option]>, NegFlag<SetFalse>, BothFlags<[NoArgumentUnused, HelpHidden]>>;
 def static_openmp: Flag<["-"], "static-openmp">,
   HelpText<"Use the static host OpenMP runtime while linking.">;
+def offload_new_driver : Flag<["--"], "offload-new-driver">, Flags<[CC1Option]>, Group<Action_Group>,
+  HelpText<"Use the new driver for offloading compilation.">;
+def no_offload_new_driver : Flag<["--"], "no-offload-new-driver">, Flags<[CC1Option]>, Group<Action_Group>,
+  HelpText<"Don't Use the new driver for offloading compilation.">;
+def offload_device_only : Flag<["--"], "offload-device-only">,
+  HelpText<"Only compile for the offloading device.">;
+def offload_host_only : Flag<["--"], "offload-host-only">,
+  HelpText<"Only compile for the offloading host.">;
+def offload_host_device : Flag<["--"], "offload-host-device">,
+  HelpText<"Only compile for the offloading host.">;
+def cuda_device_only : Flag<["--"], "cuda-device-only">, Alias<offload_device_only>,
+  HelpText<"Compile CUDA code for device only">;
+def cuda_host_only : Flag<["--"], "cuda-host-only">, Alias<offload_host_only>,
+  HelpText<"Compile CUDA code for host only. Has no effect on non-CUDA compilations.">;
+def cuda_compile_host_device : Flag<["--"], "cuda-compile-host-device">, Alias<offload_host_device>,
+  HelpText<"Compile CUDA code for both host and device (default). Has no "
+           "effect on non-CUDA compilations.">;
 def fopenmp_new_driver : Flag<["-"], "fopenmp-new-driver">, Flags<[CC1Option]>, Group<Action_Group>,
   HelpText<"Use the new driver for OpenMP offloading.">;
 def fno_openmp_new_driver : Flag<["-"], "fno-openmp-new-driver">, Flags<[CC1Option]>, Group<Action_Group>,
-  HelpText<"Don't use the new driver for OpenMP offloading.">;
+  Alias<no_offload_new_driver>, HelpText<"Don't use the new driver for OpenMP offloading.">;
 def fno_optimize_sibling_calls : Flag<["-"], "fno-optimize-sibling-calls">, Group<f_Group>, Flags<[CC1Option]>,
   HelpText<"Disable tail call optimization, keeping the call stack accurate">,
   MarshallingInfoFlag<CodeGenOpts<"DisableTailCalls">>;
@@ -4700,6 +4724,14 @@ def fno_sycl : Flag<["-"], "fno-sycl">, Flags<[NoXarchOption, CoreOption]>,
   Group<sycl_Group>, HelpText<"Disables SYCL kernels compilation for device">;
 
 //===----------------------------------------------------------------------===//
+// FLangOption + NoXarchOption
+//===----------------------------------------------------------------------===//
+
+def flang_experimental_exec : Flag<["-"], "flang-experimental-exec">,
+  Flags<[FlangOption, FlangOnlyOption, NoXarchOption, HelpHidden]>,
+  HelpText<"Enable support for generating executables (experimental)">;
+
+//===----------------------------------------------------------------------===//
 // FLangOption + CoreOption + NoXarchOption
 //===----------------------------------------------------------------------===//
 
@@ -4846,15 +4878,20 @@ def target_abi : Separate<["-"], "target-abi">,
   MarshallingInfoString<TargetOpts<"ABI">>;
 def target_sdk_version_EQ : Joined<["-"], "target-sdk-version=">,
   HelpText<"The version of target SDK used for compilation">;
-def darwin_target_variant_triple : Separate<["-"], "darwin-target-variant-triple">,
-  HelpText<"Specify the darwin target variant triple">,
-  MarshallingInfoString<TargetOpts<"DarwinTargetVariantTriple">>,
-  Normalizer<"normalizeTriple">;
 def darwin_target_variant_sdk_version_EQ : Joined<["-"],
   "darwin-target-variant-sdk-version=">,
   HelpText<"The version of darwin target variant SDK used for compilation">;
 
 } // let Flags = [CC1Option, CC1AsOption, NoDriverOption]
+
+let Flags = [CC1Option, CC1AsOption] in {
+
+def darwin_target_variant_triple : Separate<["-"], "darwin-target-variant-triple">,
+  HelpText<"Specify the darwin target variant triple">,
+  MarshallingInfoString<TargetOpts<"DarwinTargetVariantTriple">>,
+  Normalizer<"normalizeTriple">;
+
+} // let Flags = [CC1Option, CC1AsOption]
 
 //===----------------------------------------------------------------------===//
 // Target Options (cc1 + cc1as + fc1)
@@ -6699,20 +6736,21 @@ def _SLASH_ZW : CLJoined<"ZW">;
 
 def dxc_Group : OptionGroup<"<clang-dxc options>">, Flags<[DXCOption]>,
   HelpText<"dxc compatibility options">;
-
 class DXCJoinedOrSeparate<string name> : Option<["/", "-"], name,
   KIND_JOINED_OR_SEPARATE>, Group<dxc_Group>, Flags<[DXCOption, NoXarchOption]>;
 
 def dxc_help : Option<["/", "-", "--"], "help", KIND_JOINED>,
   Group<dxc_Group>, Flags<[DXCOption, NoXarchOption]>, Alias<help>,
   HelpText<"Display available options">;
-
-
 def Fo : DXCJoinedOrSeparate<"Fo">, Alias<o>,
-  HelpText<"Output object file.">;
-
+  HelpText<"Output object file">;
+def dxil_validator_version : Option<["/", "-"], "validator-version", KIND_SEPARATE>,
+  Group<dxc_Group>, Flags<[DXCOption, NoXarchOption, CC1Option, HelpHidden]>,
+  HelpText<"Override validator version for module. Format: <major.minor>;"
+           "Default: DXIL.dll version or current internal version">,
+  MarshallingInfoString<TargetOpts<"DxilValidatorVersion">>;
 def target_profile : DXCJoinedOrSeparate<"T">, MetaVarName<"<profile>">,
-  HelpText<"Set target profile.">,
+  HelpText<"Set target profile">,
   Values<"ps_6_0, ps_6_1, ps_6_2, ps_6_3, ps_6_4, ps_6_5, ps_6_6, ps_6_7,"
          "vs_6_0, vs_6_1, vs_6_2, vs_6_3, vs_6_4, vs_6_5, vs_6_6, vs_6_7,"
          "gs_6_0, gs_6_1, gs_6_2, gs_6_3, gs_6_4, gs_6_5, gs_6_6, gs_6_7,"

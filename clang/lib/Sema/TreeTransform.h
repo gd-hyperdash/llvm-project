@@ -4280,7 +4280,7 @@ TreeTransform<Derived>::TransformTemplateName(CXXScopeSpec &SS,
                                               NamedDecl *FirstQualifierInScope,
                                               bool AllowInjectedClassName) {
   if (QualifiedTemplateName *QTN = Name.getAsQualifiedTemplateName()) {
-    TemplateDecl *Template = QTN->getTemplateDecl();
+    TemplateDecl *Template = QTN->getUnderlyingTemplate().getAsTemplateDecl();
     assert(Template && "qualified template name must refer to a template");
 
     TemplateDecl *TransTemplate
@@ -12997,13 +12997,6 @@ TreeTransform<Derived>::TransformLambdaExpr(LambdaExpr *E) {
                                                         NewCallOpType);
   }
 
-  // Transform the trailing requires clause
-  ExprResult NewTrailingRequiresClause;
-  if (Expr *TRC = E->getCallOperator()->getTrailingRequiresClause())
-    // FIXME: Concepts: Substitution into requires clause should only happen
-    //                  when checking satisfaction.
-    NewTrailingRequiresClause = getDerived().TransformExpr(TRC);
-
   // Create the local class that will describe the lambda.
 
   // FIXME: DependencyKind below is wrong when substituting inside a templated
@@ -13038,7 +13031,7 @@ TreeTransform<Derived>::TransformLambdaExpr(LambdaExpr *E) {
       E->getCallOperator()->getEndLoc(),
       NewCallOpTSI->getTypeLoc().castAs<FunctionProtoTypeLoc>().getParams(),
       E->getCallOperator()->getConstexprKind(),
-      NewTrailingRequiresClause.get());
+      E->getCallOperator()->getTrailingRequiresClause());
 
   LSI->CallOperator = NewCallOperator;
 
@@ -13100,8 +13093,7 @@ TreeTransform<Derived>::TransformLambdaExpr(LambdaExpr *E) {
         }
         VarDecl *NewVD = getSema().createLambdaInitCaptureVarDecl(
             OldVD->getLocation(), InitQualType, NewC.EllipsisLoc,
-            OldVD->getIdentifier(), OldVD->getInitStyle(), Init.get(),
-            getSema().CurContext);
+            OldVD->getIdentifier(), OldVD->getInitStyle(), Init.get());
         if (!NewVD) {
           Invalid = true;
           break;
@@ -14715,7 +14707,7 @@ TreeTransform<Derived>::RebuildTemplateName(CXXScopeSpec &SS,
                                             bool TemplateKW,
                                             TemplateDecl *Template) {
   return SemaRef.Context.getQualifiedTemplateName(SS.getScopeRep(), TemplateKW,
-                                                  Template);
+                                                  TemplateName(Template));
 }
 
 template<typename Derived>

@@ -258,6 +258,15 @@ Instruction *InstCombinerImpl::SimplifyAnyMemSet(AnyMemSetInst *MI) {
     return MI;
   }
 
+  // Remove memset with an undef value.
+  // FIXME: This is technically incorrect because it might overwrite a poison
+  // value. Change to PoisonValue once #52930 is resolved.
+  if (isa<UndefValue>(MI->getValue())) {
+    // Set the size of the copy to 0, it will be deleted on the next iteration.
+    MI->setLength(Constant::getNullValue(MI->getLength()->getType()));
+    return MI;
+  }
+
   // Extract the length and alignment and fill if they are constant.
   ConstantInt *LenC = dyn_cast<ConstantInt>(MI->getLength());
   ConstantInt *FillC = dyn_cast<ConstantInt>(MI->getValue());
@@ -1115,13 +1124,6 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
     if (Constant *NumBytes = dyn_cast<Constant>(MI->getLength())) {
       if (NumBytes->isNullValue())
         return eraseInstFromFunction(CI);
-
-      if (ConstantInt *CI = dyn_cast<ConstantInt>(NumBytes))
-        if (CI->getZExtValue() == 1) {
-          // Replace the instruction with just byte operations.  We would
-          // transform other cases to loads/stores, but we don't know if
-          // alignment is sufficient.
-        }
     }
 
     // No other transformations apply to volatile transfers.

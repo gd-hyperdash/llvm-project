@@ -2791,8 +2791,10 @@ CheckDeducedArgumentConstraints(Sema& S, TemplateDeclT *Template,
                                 TemplateDeductionInfo& Info) {
   llvm::SmallVector<const Expr *, 3> AssociatedConstraints;
   Template->getAssociatedConstraints(AssociatedConstraints);
-  if (S.CheckConstraintSatisfaction(Template, AssociatedConstraints,
-                                    DeducedArgs, Info.getLocation(),
+  MultiLevelTemplateArgumentList MLTAL;
+  MLTAL.addOuterTemplateArguments(DeducedArgs);
+  if (S.CheckConstraintSatisfaction(Template, AssociatedConstraints, MLTAL,
+                                    Info.getLocation(),
                                     Info.AssociatedConstraintsSatisfaction) ||
       !Info.AssociatedConstraintsSatisfaction.IsSatisfied) {
     Info.reset(TemplateArgumentList::CreateCopy(S.Context, DeducedArgs));
@@ -4572,8 +4574,11 @@ CheckDeducedPlaceholderConstraints(Sema &S, const AutoType &Type,
   if (S.CheckTemplateArgumentList(Concept, SourceLocation(), TemplateArgs,
                                   /*PartialTemplateArgs=*/false, Converted))
     return Sema::DAR_FailedAlreadyDiagnosed;
+
+  MultiLevelTemplateArgumentList MLTAL;
+  MLTAL.addOuterTemplateArguments(Converted);
   if (S.CheckConstraintSatisfaction(Concept, {Concept->getConstraintExpr()},
-                                    Converted, TypeLoc.getLocalSourceRange(),
+                                    MLTAL, TypeLoc.getLocalSourceRange(),
                                     Satisfaction))
     return Sema::DAR_FailedAlreadyDiagnosed;
   if (!Satisfaction.IsSatisfied) {
@@ -5143,18 +5148,20 @@ static bool isVariadicFunctionTemplate(FunctionTemplateDecl *FunTmpl) {
 /// candidate with a reversed parameter order. In this case, the corresponding
 /// P/A pairs between FT1 and FT2 are reversed.
 ///
+/// \param AllowOrderingByConstraints If \c is false, don't check whether one
+/// of the templates is more constrained than the other. Default is true.
+///
 /// \returns the more specialized function template. If neither
 /// template is more specialized, returns NULL.
-FunctionTemplateDecl *
-Sema::getMoreSpecializedTemplate(FunctionTemplateDecl *FT1,
-                                 FunctionTemplateDecl *FT2,
-                                 SourceLocation Loc,
-                                 TemplatePartialOrderingContext TPOC,
-                                 unsigned NumCallArguments1,
-                                 unsigned NumCallArguments2,
-                                 bool Reversed) {
+FunctionTemplateDecl *Sema::getMoreSpecializedTemplate(
+    FunctionTemplateDecl *FT1, FunctionTemplateDecl *FT2, SourceLocation Loc,
+    TemplatePartialOrderingContext TPOC, unsigned NumCallArguments1,
+    unsigned NumCallArguments2, bool Reversed,
+    bool AllowOrderingByConstraints) {
 
-  auto JudgeByConstraints = [&] () -> FunctionTemplateDecl * {
+  auto JudgeByConstraints = [&]() -> FunctionTemplateDecl * {
+    if (!AllowOrderingByConstraints)
+      return nullptr;
     llvm::SmallVector<const Expr *, 3> AC1, AC2;
     FT1->getAssociatedConstraints(AC1);
     FT2->getAssociatedConstraints(AC2);

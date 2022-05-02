@@ -622,16 +622,27 @@ static bool isRelevantAttr(Sema &S, const Decl *D, const Attr *A) {
   }
 
   if (const auto *BA = dyn_cast<BuiltinAttr>(A)) {
-    // Do not treat 'std::forward' as a builtin if it takes an rvalue reference
-    // type and returns an lvalue reference type. The library implementation
-    // will produce an error in this case; don't get in its way.
-    if (BA->getID() == Builtin::BIforward) {
-      const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+    const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+    switch (BA->getID()) {
+    case Builtin::BIforward:
+      // Do not treat 'std::forward' as a builtin if it takes an rvalue reference
+      // type and returns an lvalue reference type. The library implementation
+      // will produce an error in this case; don't get in its way.
       if (FD && FD->getNumParams() >= 1 &&
           FD->getParamDecl(0)->getType()->isRValueReferenceType() &&
           FD->getReturnType()->isLValueReferenceType()) {
         return false;
       }
+      LLVM_FALLTHROUGH;
+    case Builtin::BImove:
+    case Builtin::BImove_if_noexcept:
+      // HACK: Super-old versions of libc++ (3.1 and earlier) provide
+      // std::forward and std::move overloads that sometimes return by value
+      // instead of by reference when building in C++98 mode. Don't treat such
+      // cases as builtins.
+      if (FD && !FD->getReturnType()->isReferenceType())
+        return false;
+      break;
     }
   }
 
@@ -2051,19 +2062,7 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
       return nullptr;
   }
 
-  // FIXME: Concepts: Do not substitute into constraint expressions
   Expr *TrailingRequiresClause = D->getTrailingRequiresClause();
-  if (TrailingRequiresClause) {
-    EnterExpressionEvaluationContext ConstantEvaluated(
-        SemaRef, Sema::ExpressionEvaluationContext::Unevaluated);
-    ExprResult SubstRC = SemaRef.SubstExpr(TrailingRequiresClause,
-                                           TemplateArgs);
-    if (SubstRC.isInvalid())
-      return nullptr;
-    TrailingRequiresClause = SubstRC.get();
-    if (!SemaRef.CheckConstraintExpression(TrailingRequiresClause))
-      return nullptr;
-  }
 
   // If we're instantiating a local function declaration, put the result
   // in the enclosing namespace; otherwise we need to find the instantiated
@@ -2171,6 +2170,11 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     // definition. We don't want non-template functions to be marked as being
     // template instantiations.
     Function->setInstantiationOfMemberFunction(D, TSK_ImplicitInstantiation);
+  } else if (!isFriend) {
+    // If this is not a function template, and this is not a friend (that is,
+    // this is a locally declared function), save the instantiation relationship
+    // for the purposes of constraint instantiation.
+    Function->setInstantiatedFromDecl(D);
   }
 
   if (isFriend) {
@@ -2409,23 +2413,6 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
       return nullptr;
   }
 
-  // FIXME: Concepts: Do not substitute into constraint expressions
-  Expr *TrailingRequiresClause = D->getTrailingRequiresClause();
-  if (TrailingRequiresClause) {
-    EnterExpressionEvaluationContext ConstantEvaluated(
-        SemaRef, Sema::ExpressionEvaluationContext::Unevaluated);
-    auto *ThisContext = dyn_cast_or_null<CXXRecordDecl>(Owner);
-    Sema::CXXThisScopeRAII ThisScope(SemaRef, ThisContext,
-                                     D->getMethodQualifiers(), ThisContext);
-    ExprResult SubstRC = SemaRef.SubstExpr(TrailingRequiresClause,
-                                           TemplateArgs);
-    if (SubstRC.isInvalid())
-      return nullptr;
-    TrailingRequiresClause = SubstRC.get();
-    if (!SemaRef.CheckConstraintExpression(TrailingRequiresClause))
-      return nullptr;
-  }
-
   DeclContext *DC = Owner;
   if (isFriend) {
     if (QualifierLoc) {
@@ -2443,6 +2430,9 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
     if (!DC) return nullptr;
   }
 
+  CXXRecordDecl *Record = cast<CXXRecordDecl>(DC);
+  Expr *TrailingRequiresClause = D->getTrailingRequiresClause();
+
   DeclarationNameInfo NameInfo
     = SemaRef.SubstDeclarationNameInfo(D->getNameInfo(), TemplateArgs);
 
@@ -2450,7 +2440,6 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
     adjustForRewrite(FunctionRewriteKind, D, T, TInfo, NameInfo);
 
   // Build the instantiated method declaration.
-  CXXRecordDecl *Record = cast<CXXRecordDecl>(DC);
   CXXMethodDecl *Method = nullptr;
 
   SourceLocation StartLoc = D->getInnerLocStart();
@@ -2757,9 +2746,6 @@ Decl *TemplateDeclInstantiator::VisitTemplateTypeParmDecl(
       // Invented template parameter type constraints will be instantiated with
       // the corresponding auto-typed parameter as it might reference other
       // parameters.
-
-      // TODO: Concepts: do not instantiate the constraint (delayed constraint
-      // substitution)
       if (SemaRef.SubstTypeConstraint(Inst, TC, TemplateArgs))
         return nullptr;
     }
@@ -4002,18 +3988,7 @@ TemplateDeclInstantiator::SubstTemplateParams(TemplateParameterList *L) {
   if (Invalid)
     return nullptr;
 
-  // FIXME: Concepts: Substitution into requires clause should only happen when
-  // checking satisfaction.
-  Expr *InstRequiresClause = nullptr;
-  if (Expr *E = L->getRequiresClause()) {
-    EnterExpressionEvaluationContext ConstantEvaluated(
-        SemaRef, Sema::ExpressionEvaluationContext::Unevaluated);
-    ExprResult Res = SemaRef.SubstExpr(E, TemplateArgs);
-    if (Res.isInvalid() || !Res.isUsable()) {
-      return nullptr;
-    }
-    InstRequiresClause = Res.get();
-  }
+  Expr *InstRequiresClause = L->getRequiresClause();
 
   TemplateParameterList *InstL
     = TemplateParameterList::Create(SemaRef.Context, L->getTemplateLoc(),
