@@ -2,7 +2,7 @@
 //
 // See ML_LICENSE.txt for license information.
 //
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 #include "clang/AST/DeclFriend.h"
 #include "clang/Lex/Preprocessor.h"
@@ -12,9 +12,9 @@
 
 using namespace clang;
 
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 // Types
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 struct ExtImpl {
   NamespaceDecl *NS = nullptr;
@@ -25,18 +25,20 @@ struct ExtImpl {
   operator bool() const { return NS && Impl; }
 };
 
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 // Globals
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 static auto constexpr ML_NS = "mlrt";
 static auto constexpr ML_EXT_DATA = "ExtImpl";
 static auto constexpr ML_SELF = "ml_self_impl";
 static auto constexpr ML_SELF_MUTABLE = "ml_self_mut_impl";
+static auto constexpr ML_SUPER = "ml_super_impl";
+static auto constexpr ML_SUPER_MUTABLE = "ml_super_mut_impl";
 
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 // Helpers
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 static Expr *UnwrapHookExpr(Expr *E) {
   if (auto UO = dyn_cast<UnaryOperator>(E)) {
@@ -235,11 +237,11 @@ UnaryOperator *BuildAddrOf(Sema &S, Expr *E,
   return nullptr;
 }
 
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 // SemaML
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
-bool SemaML::isMLNamespace(const DeclContext *DC) {
+bool SemaML::IsMLNamespace(const DeclContext *DC) {
   if (!DC) {
     return false;
   }
@@ -252,11 +254,39 @@ bool SemaML::isMLNamespace(const DeclContext *DC) {
     }
   }
 
-  return isMLNamespace(DC->getParent());
+  return IsMLNamespace(DC->getParent());
 }
 
-bool SemaML::isInMLNamespace(const Decl *D) {
-  return D ? isMLNamespace(D->getDeclContext()) : false;
+bool SemaML::IsInMLNamespace(const Decl *D) {
+  return D ? IsMLNamespace(D->getDeclContext()) : false;
+}
+
+DeclarationNameInfo SemaML::BuildDNI(const IdentifierInfo *II,
+                                     SourceLocation Loc) {
+  UnqualifiedId Id;
+  TemplateArgumentListInfo TemplateArgsBuffer;
+  const TemplateArgumentListInfo *TemplateArgs;
+  DeclarationNameInfo NameInfo;
+
+  Id.setIdentifier(II, Loc);
+  S.DecomposeUnqualifiedId(Id, TemplateArgsBuffer, NameInfo, TemplateArgs);
+
+  return NameInfo;
+}
+
+bool SemaML::InjectSuperKW(CXXRecordDecl *E, TypeSourceInfo *B) {
+  const IdentifierInfo *II = &S.PP.getIdentifierTable().get("super");
+  auto NameInfo = BuildDNI(II, SourceLocation());
+  auto Field = S.CheckFieldDecl(
+      NameInfo.getName(), S.Context.getPointerType(B->getType()), B, E,
+      SourceLocation(), false, nullptr, ICIS_NoInit, SourceLocation(),
+      AccessSpecifier::AS_public, nullptr, nullptr);
+  if (Field) {
+    E->addDecl(Field);
+    return true;
+  }
+
+  return false;
 }
 
 ExprResult SemaML::LookupHookBaseImpl(CXXRecordDecl *Base, LookupResult &R) {
@@ -270,16 +300,14 @@ ExprResult SemaML::LookupHookBaseImpl(CXXRecordDecl *Base, LookupResult &R) {
   auto &Unresolved = R.asUnresolvedSet();
 
   if (Unresolved.size()) {
-    auto M = cast<CXXMethodDecl>(*Unresolved.begin());
-
-    // Build qualifier.
     auto Q = BuildRecordQualifier(S, Base);
 
-    // Build expression.
     if (Unresolved.size() == 1u) {
-      auto DeclRef = S.BuildDeclRefExpr(
-          M, M->getType(), ExprValueKind::VK_PRValue, M->getNameInfo(), Q);
-      return BuildAddrOf(S, DeclRef, DNI.getLoc());
+      if (auto M = dyn_cast<CXXMethodDecl>(*Unresolved.begin())) {
+        auto DeclRef = S.BuildDeclRefExpr(
+            M, M->getType(), ExprValueKind::VK_PRValue, M->getNameInfo(), Q);
+        return BuildAddrOf(S, DeclRef, DNI.getLoc());
+      }
     } else {
       auto ULE = S.CreateUnresolvedLookupExpr(Base, Q, DNI, Unresolved, false);
 
@@ -295,21 +323,14 @@ ExprResult SemaML::LookupHookBaseImpl(CXXRecordDecl *Base, LookupResult &R) {
 CXXMethodDecl *SemaML::LookupBuiltinImpl(CXXRecordDecl *E,
                                          const IdentifierInfo *II,
                                          SourceLocation Loc) {
-  UnqualifiedId Id;
-  TemplateArgumentListInfo TemplateArgsBuffer;
-  const TemplateArgumentListInfo *TemplateArgs;
-  DeclarationNameInfo NameInfo;
-
-  // Build name info.
-  Id.setIdentifier(II, Loc);
-  S.DecomposeUnqualifiedId(Id, TemplateArgsBuffer, NameInfo, TemplateArgs);
+  DeclarationNameInfo NameInfo = BuildDNI(II, Loc);
 
   // Perform lookup.
   LookupResult R(S, NameInfo, Sema::LookupNameKind::LookupMemberName);
 
   if (S.LookupQualifiedName(R, E)) {
     auto Result = R.getAsSingle<CXXMethodDecl>();
-    if (isInMLNamespace(Result))
+    if (IsInMLNamespace(Result))
       return Result;
   }
 
@@ -336,7 +357,14 @@ CXXMethodDecl *SemaML::LookupBuiltinSelf(CXXRecordDecl *E, SourceLocation Loc,
                                          bool Mutable) {
   const IdentifierInfo *II =
       &S.PP.getIdentifierTable().get(Mutable ? ML_SELF_MUTABLE : ML_SELF);
-  return II ? LookupBuiltinImpl(E, II, Loc) : nullptr;
+  return LookupBuiltinImpl(E, II, Loc);
+}
+
+CXXMethodDecl *SemaML::LookupBuiltinSuper(CXXRecordDecl *E, SourceLocation Loc,
+                                         bool Mutable) {
+  const IdentifierInfo *II =
+      &S.PP.getIdentifierTable().get(Mutable ? ML_SUPER_MUTABLE : ML_SUPER);
+  return LookupBuiltinImpl(E, II, Loc);
 }
 
 SemaML::HookBaseKind SemaML::GetHookBaseKind(Expr *BaseExpr) {
@@ -507,16 +535,17 @@ TypeSourceInfo *SemaML::AttachBaseToExtension(CXXRecordDecl *E,
                            SpecInfo, SourceLocation());
 
   if (Specifier && !S.AttachBaseSpecifiers(E, {Specifier}) &&
-      InsertFriend(S, Base, E) && InsertFriend(S, E, Spec)) {
+      InsertFriend(S, Base, E) && InsertFriend(S, E, Spec) &&
+      InjectSuperKW(E, B)) {
     return Context.getTrivialTypeSourceInfo(Context.getRecordType(Base));
   }
 
   return nullptr;
 }
 
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 // Attribute Handlers
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 void clang::handleLinkNameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   StringRef Symbol;
@@ -539,14 +568,14 @@ void clang::handleLinkNameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     }
   }
 
-  if (S.ML.hasLinkNameCached(Symbol)) {
+  if (S.ML.HasLinkNameCached(Symbol)) {
     S.Diag(AL.getLoc(), diag::err_link_name_duplicate);
     return;
   }
 
   // Add attribute.
   D->addAttr(::new (S.Context) LinkNameAttr(S.Context, AL, Symbol));
-  S.ML.cacheLinkName(Symbol);
+  S.ML.CacheLinkName(Symbol);
 }
 
 void clang::handleDynamicLinkageAttr(Sema &S, Decl *D, const ParsedAttr &AL) {

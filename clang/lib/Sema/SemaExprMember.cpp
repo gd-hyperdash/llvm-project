@@ -9,7 +9,6 @@
 //  This file implements semantic analysis member access expressions.
 //
 //===----------------------------------------------------------------------===//
-#include "clang/Sema/Overload.h"
 #include "clang/AST/ASTLambda.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
@@ -892,24 +891,83 @@ BuildMSPropertyRefExpr(Sema &S, Expr *BaseExpr, bool IsArrow,
                                            NameInfo.getLoc());
 }
 
-static Expr *HandleExtensionBaseExpr(Sema &SemaRef, Expr *Base, bool IsArrow) {
-  assert(Base && "No expr?");
-  auto Ty = Base->getType()->getPointeeType();
+static Expr *HandleExtensionSuperExpr(Sema &SemaRef, Expr *BaseExpr,
+                                      bool IsArrow) {
+  if (!IsArrow) {
+    if (auto UO = dyn_cast<UnaryOperator>(BaseExpr->IgnoreParenCasts())) {
+      BaseExpr = UO->getSubExpr();
+    }
+  }
 
-  if (Ty.isNull())
-    Ty = Base->getType();
+  auto ME = dyn_cast<MemberExpr>(BaseExpr->IgnoreParenCasts());
 
-  auto E = Ty->getAsCXXRecordDecl();
-  bool IsMutable = !Ty.isConstQualified();
+  if (ME && ME->getMemberNameInfo().getName().getAsIdentifierInfo() ==
+                &SemaRef.PP.getIdentifierTable().get("super")) {
+    // Is this access from an extension?
+    auto ThisExpr = ME->getBase();
+    assert(ThisExpr && "No expr?");
+    auto ThisTy = ThisExpr->getType()->getPointeeType();
 
-  if (E && E->hasAttr<RecordExtensionAttr>()) {
-    auto Self = SemaRef.ML.LookupBuiltinSelf(const_cast<CXXRecordDecl *>(E),
-                                             Base->getExprLoc(), IsMutable);
+    if (ThisTy.isNull())
+      ThisTy = ThisExpr->getType();
+
+    assert(!ThisTy.isNull() && "No type?");
+    auto ThisClass = ThisTy->getAsCXXRecordDecl();
+    bool IsMutable = !ThisTy.isConstQualified();
+
+    if (ThisClass && ThisClass->hasAttr<RecordExtensionAttr>()) {
+      auto Super =
+          SemaRef.ML.LookupBuiltinSuper(const_cast<CXXRecordDecl *>(ThisClass),
+                                        BaseExpr->getExprLoc(), IsMutable);
+
+      if (Super) {
+        auto AP = DeclAccessPair::make(Super, AccessSpecifier::AS_public);
+        auto Member = MemberExpr::Create(
+            SemaRef.Context, ThisExpr, IsArrow, BaseExpr->getExprLoc(),
+            NestedNameSpecifierLoc(), SourceLocation(), Super, AP,
+            Super->getNameInfo(), nullptr, SemaRef.Context.BoundMemberTy,
+            ExprValueKind::VK_PRValue, ExprObjectKind::OK_Ordinary,
+            NonOdrUseReason::NOUR_None);
+        auto Call = SemaRef.BuildCallToMemberFunction(
+            nullptr, Member, SourceLocation(), {}, SourceLocation());
+
+        if (Call.isUsable()) {
+          SemaRef.MarkMemberReferenced(Member);
+          return Call.get();
+        }
+      }
+      SemaRef.Diag(BaseExpr->getExprLoc(), diag::err_extension_member_access);
+    }
+  }
+
+  return nullptr;
+}
+
+static Expr *HandleExtensionSelfExpr(Sema &SemaRef, Expr *BaseExpr,
+                                     bool IsArrow, bool IsSuper) {
+  assert(BaseExpr && "No expr?");
+
+  // Get class type.
+  auto ThisTy = BaseExpr->getType()->getPointeeType();
+
+  if (ThisTy.isNull())
+    ThisTy = BaseExpr->getType();
+
+  assert(!ThisTy.isNull() && "No type?");
+  auto ThisClass = ThisTy->getAsCXXRecordDecl();
+  bool IsMutable = !ThisTy.isConstQualified();
+
+  if (ThisClass && ThisClass->hasAttr<RecordExtensionAttr>()) {
+    // Super expression doesn't need any self instantiation.
+    if (!IsSuper) {
+      auto Self =
+          SemaRef.ML.LookupBuiltinSelf(const_cast<CXXRecordDecl *>(ThisClass),
+                                       BaseExpr->getExprLoc(), IsMutable);
 
     if (Self) {
       auto AP = DeclAccessPair::make(Self, AccessSpecifier::AS_public);
       auto Member = MemberExpr::Create(
-          SemaRef.Context, Base, IsArrow, Base->getExprLoc(),
+            SemaRef.Context, BaseExpr, IsArrow, BaseExpr->getExprLoc(),
           NestedNameSpecifierLoc(), SourceLocation(), Self, AP,
           Self->getNameInfo(), nullptr, SemaRef.Context.BoundMemberTy,
           ExprValueKind::VK_PRValue, ExprObjectKind::OK_Ordinary,
@@ -923,7 +981,8 @@ static Expr *HandleExtensionBaseExpr(Sema &SemaRef, Expr *Base, bool IsArrow) {
       }
     }
 
-    SemaRef.Diag(Base->getExprLoc(), diag::err_extension_member_access);
+      SemaRef.Diag(BaseExpr->getExprLoc(), diag::err_extension_member_access);
+    }
   }
 
   return nullptr;
@@ -951,7 +1010,14 @@ MemberExpr *Sema::BuildMemberExpr(
   assert((!IsArrow || Base->isPRValue()) &&
          "-> base must be a pointer prvalue");
 
-  Expr *NewExpr = HandleExtensionBaseExpr(*this, Base, IsArrow);
+  auto NewExpr = HandleExtensionSuperExpr(*this, Base, IsArrow);
+
+  if (!NewExpr) {
+    NewExpr = HandleExtensionSelfExpr(
+        *this, Base, IsArrow,
+        Member->getIdentifier() == &PP.getIdentifierTable().get("super"));
+  }
+
   if (NewExpr) {
     Base = NewExpr;
     IsArrow = true;

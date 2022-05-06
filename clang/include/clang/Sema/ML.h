@@ -1,8 +1,8 @@
-//===- ML.h - Sema ML extensions ---------------------------------*- C++ -*-===//
+//===- ML.h - Sema ML extensions ---------------------------------*- C++-*-===//
 //
 // See ML_LICENSE.txt for license information.
 //
-//===-----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_SEMA_ML_H
 #define LLVM_CLANG_SEMA_ML_H
@@ -42,11 +42,15 @@ protected:
                                    SourceLocation Loc);
 
 public:
-  bool isMLNamespace(const DeclContext *DC);
-  bool isInMLNamespace(const Decl *D);
+  bool IsMLNamespace(const DeclContext *DC);
+  bool IsInMLNamespace(const Decl *D);
 
-  void cacheLinkName(StringRef S) { LinkNameCache.insert(S); }
-  bool hasLinkNameCached(StringRef S) { return LinkNameCache.contains(S); }
+  void CacheLinkName(StringRef S) { LinkNameCache.insert(S); }
+  bool HasLinkNameCached(StringRef S) { return LinkNameCache.contains(S); }
+
+  DeclarationNameInfo BuildDNI(const IdentifierInfo *II, SourceLocation Loc);
+
+  bool InjectSuperKW(CXXRecordDecl *E, TypeSourceInfo *B);
 
   ExprResult LookupHookMemberBase(CXXRecordDecl *Base,
                                   const DeclarationNameInfo &DNI);
@@ -54,6 +58,8 @@ public:
 
   CXXMethodDecl *LookupBuiltinSelf(CXXRecordDecl *E, SourceLocation Loc,
                                    bool Mutable);
+  CXXMethodDecl *LookupBuiltinSuper(CXXRecordDecl *E, SourceLocation Loc,
+                                    bool Mutable);
 
   HookBaseKind GetHookBaseKind(Expr *BaseExpr);
   FunctionDecl *HandleSimpleBase(FunctionDecl *H, Expr *BaseExpr);
