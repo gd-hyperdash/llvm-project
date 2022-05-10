@@ -1390,6 +1390,36 @@ Expr *Sema::BuildCXXThisExpr(SourceLocation Loc, QualType Type,
                              bool IsImplicit) {
   auto *This = new (Context) CXXThisExpr(Loc, Type, IsImplicit);
   MarkThisReferenced(This);
+
+  // If this is an extension type, replace it with the self builtin.
+  auto ThisTy = Type->getPointeeType();
+  assert(!ThisTy.isNull() && "No type?");
+  auto ThisRecord = ThisTy->getAsCXXRecordDecl();
+  assert(ThisRecord && "No record?");
+
+  if (ThisRecord->hasAttr<RecordExtensionAttr>()) {
+    auto Self = ML.LookupBuiltinSelf(
+        const_cast<CXXRecordDecl *>(ThisRecord), This->getExprLoc(),
+        !ThisTy.isConstQualified(), ML.IsInHookScope());
+
+    if (Self) {
+      auto AP = DeclAccessPair::make(Self, AccessSpecifier::AS_public);
+      auto Member = MemberExpr::Create(
+          Context, This, true, This->getExprLoc(), NestedNameSpecifierLoc(),
+          SourceLocation(), Self, AP, Self->getNameInfo(), nullptr,
+          Context.BoundMemberTy, ExprValueKind::VK_PRValue,
+          ExprObjectKind::OK_Ordinary, NonOdrUseReason::NOUR_None);
+      auto Call = BuildCallToMemberFunction(nullptr, Member, SourceLocation(),
+                                            {}, SourceLocation());
+      if (Call.isUsable()) {
+        MarkMemberReferenced(Member);
+        return Call.get();
+      }
+    }
+
+    Diag(This->getExprLoc(), diag::err_extension_member_access);
+  }
+
   return This;
 }
 

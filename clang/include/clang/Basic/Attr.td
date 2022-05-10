@@ -4016,9 +4016,8 @@ def DynamicLinkage : InheritableAttr {
 }
 
 def Hook : InheritableAttr {
-  let Spellings = [GNU<"hook">, Declspec<"hook">,
-                  CXX11<"", "hook", 201703>, C2x<"", "hook", 201904>];
-  let Args = [DeclArgument<Function, "Base">, BoolArgument<"Lock", 1>];
+  let Spellings = [CXX11<"", "hook", 201703>, C2x<"", "hook", 201904>];
+  let Args = [DeclArgument<Function, "Base">, IntArgument<"Flags", 1>];
   let Subjects = SubjectList<[Function], ErrorDiag>;
   let Documentation = [Undocumented];
 }
@@ -4026,6 +4025,12 @@ def Hook : InheritableAttr {
 def RecordExtension : InheritableAttr {
   let Spellings = [Keyword<"extends">];
   let Args = [TypeArgument<"Base">];
+  let Subjects = SubjectList<[CXXRecord], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def NoDeallocator : InheritableAttr {
+  let Spellings = [CXX11<"", "no_deallocator", 201703>];
   let Subjects = SubjectList<[CXXRecord], ErrorDiag>;
   let Documentation = [Undocumented];
 }

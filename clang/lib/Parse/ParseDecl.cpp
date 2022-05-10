@@ -3085,11 +3085,13 @@ bool Parser::IsMaybeMLDynamicRecordAttribute() {
 }
 
 void Parser::MaybeParseMLDynamicAttribute(ParsedAttributes &Attributes) {
-  auto AttrName = Tok.getIdentifierInfo();
-  if (AttrName == &PP.getIdentifierTable().get("dynamic")) {
-    auto AttrLoc = ConsumeToken();
-    Attributes.addNew(AttrName, AttrLoc, nullptr, AttrLoc, nullptr, 0,
-                      ParsedAttr::AS_Keyword);
+  if (Tok.is(tok::identifier)) {
+    auto AttrName = Tok.getIdentifierInfo();
+    if (AttrName == &PP.getIdentifierTable().get("dynamic")) {
+      auto AttrLoc = ConsumeToken();
+      Attributes.addNew(AttrName, AttrLoc, nullptr, AttrLoc, nullptr, 0,
+                        ParsedAttr::AS_Keyword);
+    }
   }
 }
 

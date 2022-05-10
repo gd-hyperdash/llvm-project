@@ -2203,6 +2203,42 @@ static void flushDiagnostics(Sema &S, const sema::FunctionScopeInfo *fscope) {
     S.Diag(D.Loc, D.PD);
 }
 
+void sema::AnalysisBasedWarnings::TryExtensionDtorHook(const CXXRecordDecl *E) {
+  auto MD = E->bases_begin()->getType()->getAsCXXRecordDecl();
+  assert(MD && "No metadata class?");
+  auto Base =
+      E->getAttr<RecordExtensionAttr>()->getBase()->getAsCXXRecordDecl();
+  assert(Base && "No base?");
+
+  // Attempt to hook dtor only if we have members and no_deallocator is not
+  // specified.
+  if (!E->hasAttr<NoDeallocatorAttr>() &&
+      (S.Context.getTypeSize(S.Context.getRecordType(E)) >
+       S.Context.getTypeSize(
+           S.Context.getPointerType(S.Context.getRecordType(Base))))) {
+    bool DtorHooked = false;
+
+    if (auto Dtor = Base->getDestructor()) {
+      auto Hook = S.ML.LookupBuiltinDtorHook(MD);
+      if (Hook) {
+        // Construct fake attribute.
+        AttributeFactory AF;
+        ParsedAttributes PA(AF);
+        PA.addNew(&S.PP.getIdentifierTable().get("hook"), SourceRange(),
+                  nullptr, SourceLocation(), nullptr, 0u,
+                  AttributeCommonInfo::AS_Keyword, SourceLocation());
+        Hook->addAttr(::new (S.Context) HookAttr(S.Context, PA.back(), Dtor));
+        DtorHooked = true;
+      }
+    }
+
+    if (!DtorHooked) {
+      S.Diag(E->getLocation(), diag::warn_extension_dtor_hook);
+      S.Diag(E->getLocation(), diag::note_extension_deallocator_workaround);
+    }
+  }
+}
+
 void clang::sema::AnalysisBasedWarnings::IssueWarnings(
     sema::AnalysisBasedWarnings::Policy P, sema::FunctionScopeInfo *fscope,
     const Decl *D, QualType BlockType) {

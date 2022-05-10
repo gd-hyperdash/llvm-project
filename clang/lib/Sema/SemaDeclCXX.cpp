@@ -2725,9 +2725,26 @@ NoteIndirectBases(ASTContext &Context, IndirectBaseSet &Set,
 /// Performs the actual work of attaching the given base class
 /// specifiers to a C++ class.
 bool Sema::AttachBaseSpecifiers(CXXRecordDecl *Class,
-                                MutableArrayRef<CXXBaseSpecifier *> Bases) {
- if (Bases.empty())
+                                MutableArrayRef<CXXBaseSpecifier *> NewBases) {
+  llvm::SmallVector<CXXBaseSpecifier *, 4> Bases;
+
+  if (NewBases.empty())
     return false;
+
+  // Check if this class is defined.
+  if (!Class->hasDefinition())
+    return true;
+
+  // If this is an extension we have to save the ML metadata base.
+  if (Class->hasAttr<RecordExtensionAttr>()) {
+    for (auto B : Class->bases()) {
+      Bases.push_back(&B);
+    }
+  }
+  
+  for (auto B : NewBases) {
+    Bases.push_back(B);
+  }
 
   // Used to keep track of which base types we have already seen, so
   // that we can properly diagnose redundant direct base types. Note

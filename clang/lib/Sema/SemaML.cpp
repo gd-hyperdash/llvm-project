@@ -29,12 +29,17 @@ struct ExtImpl {
 // Globals
 //===----------------------------------------------------------------------===//
 
-static auto constexpr ML_NS = "mlrt";
-static auto constexpr ML_EXT_DATA = "ExtImpl";
-static auto constexpr ML_SELF = "ml_self_impl";
-static auto constexpr ML_SELF_MUTABLE = "ml_self_mut_impl";
-static auto constexpr ML_SUPER = "ml_super_impl";
-static auto constexpr ML_SUPER_MUTABLE = "ml_super_mut_impl";
+constexpr static auto ML_NS = "mlrt";
+constexpr static auto ML_EXT_DATA = "ExtImpl";
+constexpr static auto ML_SELF = "_SelfImpl";
+constexpr static auto ML_SELF_HOOK = "_SelfFromHookImpl";
+constexpr static auto ML_SUPER = "_SuperImpl";
+constexpr static auto ML_SUPER_HOOK = "_SuperFromHookImpl";
+constexpr static auto ML_SELF_MUT = "_MutSelfImpl";
+constexpr static auto ML_SELF_HOOK_MUT = "_MutSelfFromHookImpl";
+constexpr static auto ML_SUPER_MUT = "_MutSuperImpl";
+constexpr static auto ML_SUPER_HOOK_MUT = "_MutSuperFromHookImpl";
+constexpr static auto ML_DEFAULT_DTOR_HOOK = "_DefaultDtorHook";
 
 //===----------------------------------------------------------------------===//
 // Helpers
@@ -52,7 +57,9 @@ static Expr *UnwrapHookExpr(Expr *E) {
 
 static bool CheckHookBase(Sema &S, FunctionDecl const *H,
                           FunctionDecl const *FD) {
-  assert(H && FD && "No func?");
+  if (!H || !FD)
+    return false;
+
   auto HTy = H->getType()->getAs<FunctionProtoType>();
   auto FDTy = FD->getType()->getAs<FunctionProtoType>();
   assert(HTy && FDTy && "No type?");
@@ -289,6 +296,19 @@ bool SemaML::InjectSuperKW(CXXRecordDecl *E, TypeSourceInfo *B) {
   return false;
 }
 
+bool SemaML::IsInHookScope() {
+  if (auto Scope = S.getCurScope()) {
+    auto FnScope = Scope->getFnParent();
+
+    if (FnScope) {
+      auto Fn = cast_or_null<FunctionDecl>(FnScope->getEntity());
+      return Fn && Fn->hasAttr<HookAttr>();
+    }
+  }
+
+  return false;
+}
+
 ExprResult SemaML::LookupHookBaseImpl(CXXRecordDecl *Base, LookupResult &R) {
   DeclarationNameInfo DNI = R.getLookupNameInfo();
 
@@ -354,17 +374,38 @@ ExprResult SemaML::LookupHookDtorBase(CXXRecordDecl *Base) {
 }
 
 CXXMethodDecl *SemaML::LookupBuiltinSelf(CXXRecordDecl *E, SourceLocation Loc,
-                                         bool Mutable) {
-  const IdentifierInfo *II =
-      &S.PP.getIdentifierTable().get(Mutable ? ML_SELF_MUTABLE : ML_SELF);
+                                         bool Mutable, bool HookScope) {
+  StringRef Sym;
+
+  if (Mutable) {
+    Sym = HookScope ? ML_SELF_HOOK_MUT : ML_SELF_MUT;
+  } else {
+    Sym = HookScope ? ML_SELF_HOOK : ML_SELF;
+  }
+
+  const IdentifierInfo *II = &S.PP.getIdentifierTable().get(Sym);
   return LookupBuiltinImpl(E, II, Loc);
 }
 
 CXXMethodDecl *SemaML::LookupBuiltinSuper(CXXRecordDecl *E, SourceLocation Loc,
-                                         bool Mutable) {
-  const IdentifierInfo *II =
-      &S.PP.getIdentifierTable().get(Mutable ? ML_SUPER_MUTABLE : ML_SUPER);
+                                          bool Mutable, bool HookScope) {
+
+  StringRef Sym;
+
+  if (Mutable) {
+    Sym = HookScope ? ML_SUPER_HOOK_MUT : ML_SUPER_MUT;
+  } else {
+    Sym = HookScope ? ML_SUPER_HOOK : ML_SUPER;
+  }
+
+  const IdentifierInfo *II = &S.PP.getIdentifierTable().get(Sym);
   return LookupBuiltinImpl(E, II, Loc);
+}
+
+CXXMethodDecl *SemaML::LookupBuiltinDtorHook(CXXRecordDecl *MD) {
+  const IdentifierInfo *II =
+      &S.PP.getIdentifierTable().get(ML_DEFAULT_DTOR_HOOK);
+  return S.ML.LookupBuiltinImpl(MD, II, SourceLocation());
 }
 
 SemaML::HookBaseKind SemaML::GetHookBaseKind(Expr *BaseExpr) {
@@ -536,9 +577,8 @@ TypeSourceInfo *SemaML::AttachBaseToExtension(CXXRecordDecl *E,
 
   if (Specifier && !S.AttachBaseSpecifiers(E, {Specifier}) &&
       InsertFriend(S, Base, E) && InsertFriend(S, E, Spec) &&
-      InjectSuperKW(E, B)) {
+      InsertFriend(S, Base, Spec) && InjectSuperKW(E, B))
     return Context.getTrivialTypeSourceInfo(Context.getRecordType(Base));
-  }
 
   return nullptr;
 }
@@ -647,4 +687,8 @@ void clang::handleRecordExtensionAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   } else {
     S.Diag(AL.getLoc(), diag::err_extension_failed);
   }
+}
+
+void clang::handleNoDeallocatorAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  D->addAttr(::new (S.Context) NoDeallocatorAttr(S.Context, AL));
 }

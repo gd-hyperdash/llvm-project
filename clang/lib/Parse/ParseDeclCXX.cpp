@@ -1435,7 +1435,9 @@ void Parser::MaybeParseMLExtendsAttribute(ParsedAttributes &Attributes) {
     SourceLocation EndLoc;
     SourceLocation KWLoc = ConsumeToken();
 
+    Actions.ML.ParsingExtendsKW = true;
     TypeResult Ty = ParseBaseTypeSpecifier(KWLoc, EndLoc);
+    Actions.ML.ParsingExtendsKW = false;
 
     if (Ty.isInvalid())
       return;
@@ -2105,6 +2107,14 @@ void Parser::ParseClassSpecifier(tok::TokenKind TagTokKind,
 
   if (Result)
     Diag(StartLoc, DiagID) << PrevSpec;
+
+  // If this turns out to be an extension, attempt to hook the dtor.
+  if (DeclSpec::isDeclRep(DS.getTypeSpecType())) {
+    auto E = dyn_cast<CXXRecordDecl>(DS.getRepAsDecl());
+    if (E && E->hasAttr<RecordExtensionAttr>()) {
+      Actions.AnalysisWarnings.TryExtensionDtorHook(E);
+    }
+  }
 
   // At this point, we've successfully parsed a class-specifier in 'definition'
   // form (e.g. "struct foo { int x; }".  While we could just return here, we're

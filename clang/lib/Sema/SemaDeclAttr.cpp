@@ -9056,6 +9056,10 @@ static void ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D,
   case ParsedAttr::AT_RecordExtension:
     handleRecordExtensionAttr(S, D, AL);
     break;
+
+  case ParsedAttr::AT_NoDeallocator:
+    handleNoDeallocatorAttr(S, D, AL);
+    break;
   }
 }
 

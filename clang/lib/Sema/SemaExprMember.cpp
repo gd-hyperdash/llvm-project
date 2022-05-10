@@ -891,103 +891,6 @@ BuildMSPropertyRefExpr(Sema &S, Expr *BaseExpr, bool IsArrow,
                                            NameInfo.getLoc());
 }
 
-static Expr *HandleExtensionSuperExpr(Sema &SemaRef, Expr *BaseExpr,
-                                      bool IsArrow) {
-  if (!IsArrow) {
-    if (auto UO = dyn_cast<UnaryOperator>(BaseExpr->IgnoreParenCasts())) {
-      BaseExpr = UO->getSubExpr();
-    }
-  }
-
-  auto ME = dyn_cast<MemberExpr>(BaseExpr->IgnoreParenCasts());
-
-  if (ME && ME->getMemberNameInfo().getName().getAsIdentifierInfo() ==
-                &SemaRef.PP.getIdentifierTable().get("super")) {
-    // Is this access from an extension?
-    auto ThisExpr = ME->getBase();
-    assert(ThisExpr && "No expr?");
-    auto ThisTy = ThisExpr->getType()->getPointeeType();
-
-    if (ThisTy.isNull())
-      ThisTy = ThisExpr->getType();
-
-    assert(!ThisTy.isNull() && "No type?");
-    auto ThisClass = ThisTy->getAsCXXRecordDecl();
-    bool IsMutable = !ThisTy.isConstQualified();
-
-    if (ThisClass && ThisClass->hasAttr<RecordExtensionAttr>()) {
-      auto Super =
-          SemaRef.ML.LookupBuiltinSuper(const_cast<CXXRecordDecl *>(ThisClass),
-                                        BaseExpr->getExprLoc(), IsMutable);
-
-      if (Super) {
-        auto AP = DeclAccessPair::make(Super, AccessSpecifier::AS_public);
-        auto Member = MemberExpr::Create(
-            SemaRef.Context, ThisExpr, IsArrow, BaseExpr->getExprLoc(),
-            NestedNameSpecifierLoc(), SourceLocation(), Super, AP,
-            Super->getNameInfo(), nullptr, SemaRef.Context.BoundMemberTy,
-            ExprValueKind::VK_PRValue, ExprObjectKind::OK_Ordinary,
-            NonOdrUseReason::NOUR_None);
-        auto Call = SemaRef.BuildCallToMemberFunction(
-            nullptr, Member, SourceLocation(), {}, SourceLocation());
-
-        if (Call.isUsable()) {
-          SemaRef.MarkMemberReferenced(Member);
-          return Call.get();
-        }
-      }
-      SemaRef.Diag(BaseExpr->getExprLoc(), diag::err_extension_member_access);
-    }
-  }
-
-  return nullptr;
-}
-
-static Expr *HandleExtensionSelfExpr(Sema &SemaRef, Expr *BaseExpr,
-                                     bool IsArrow, bool IsSuper) {
-  assert(BaseExpr && "No expr?");
-
-  // Get class type.
-  auto ThisTy = BaseExpr->getType()->getPointeeType();
-
-  if (ThisTy.isNull())
-    ThisTy = BaseExpr->getType();
-
-  assert(!ThisTy.isNull() && "No type?");
-  auto ThisClass = ThisTy->getAsCXXRecordDecl();
-  bool IsMutable = !ThisTy.isConstQualified();
-
-  if (ThisClass && ThisClass->hasAttr<RecordExtensionAttr>()) {
-    // Super expression doesn't need any self instantiation.
-    if (!IsSuper) {
-      auto Self =
-          SemaRef.ML.LookupBuiltinSelf(const_cast<CXXRecordDecl *>(ThisClass),
-                                       BaseExpr->getExprLoc(), IsMutable);
-
-    if (Self) {
-      auto AP = DeclAccessPair::make(Self, AccessSpecifier::AS_public);
-      auto Member = MemberExpr::Create(
-            SemaRef.Context, BaseExpr, IsArrow, BaseExpr->getExprLoc(),
-          NestedNameSpecifierLoc(), SourceLocation(), Self, AP,
-          Self->getNameInfo(), nullptr, SemaRef.Context.BoundMemberTy,
-          ExprValueKind::VK_PRValue, ExprObjectKind::OK_Ordinary,
-          NonOdrUseReason::NOUR_None);
-      auto Call = SemaRef.BuildCallToMemberFunction(
-          nullptr, Member, SourceLocation(), {}, SourceLocation());
-
-      if (Call.isUsable()) {
-        SemaRef.MarkMemberReferenced(Member);
-        return Call.get();
-      }
-    }
-
-      SemaRef.Diag(BaseExpr->getExprLoc(), diag::err_extension_member_access);
-    }
-  }
-
-  return nullptr;
-}
-
 MemberExpr *Sema::BuildMemberExpr(
     Expr *Base, bool IsArrow, SourceLocation OpLoc, const CXXScopeSpec *SS,
     SourceLocation TemplateKWLoc, ValueDecl *Member, DeclAccessPair FoundDecl,
@@ -1009,20 +912,6 @@ MemberExpr *Sema::BuildMemberExpr(
     const TemplateArgumentListInfo *TemplateArgs) {
   assert((!IsArrow || Base->isPRValue()) &&
          "-> base must be a pointer prvalue");
-
-  auto NewExpr = HandleExtensionSuperExpr(*this, Base, IsArrow);
-
-  if (!NewExpr) {
-    NewExpr = HandleExtensionSelfExpr(
-        *this, Base, IsArrow,
-        Member->getIdentifier() == &PP.getIdentifierTable().get("super"));
-  }
-
-  if (NewExpr) {
-    Base = NewExpr;
-    IsArrow = true;
-  }
-
   MemberExpr *E =
       MemberExpr::Create(Context, Base, IsArrow, OpLoc, NNS, TemplateKWLoc,
                          Member, FoundDecl, MemberNameInfo, TemplateArgs, Ty,
@@ -1203,6 +1092,38 @@ Sema::BuildMemberReferenceExpr(Expr *BaseExpr, QualType BaseExprType,
   // Check the use of this member.
   if (DiagnoseUseOfDecl(MemberDecl, MemberLoc))
     return ExprError();
+
+  // Handle super keyword for extensions.
+  if (MemberDecl->getIdentifier() == &PP.getIdentifierTable().get("super")) {
+    // Is this an extension?
+    auto ThisRecord = BaseType->getAsCXXRecordDecl();
+    assert(ThisRecord && "No record?");
+
+    if (ThisRecord->hasAttr<RecordExtensionAttr>()) {
+      auto Super = ML.LookupBuiltinSuper(
+          const_cast<CXXRecordDecl *>(ThisRecord), BaseExpr->getExprLoc(),
+          !BaseType.isConstQualified(), ML.IsInHookScope());
+
+      if (Super) {
+        auto AP = DeclAccessPair::make(Super, AccessSpecifier::AS_public);
+        auto Member = MemberExpr::Create(
+            Context, BaseExpr, IsArrow, BaseExpr->getExprLoc(),
+            NestedNameSpecifierLoc(), SourceLocation(), Super, AP,
+            Super->getNameInfo(), nullptr, Context.BoundMemberTy,
+            ExprValueKind::VK_PRValue, ExprObjectKind::OK_Ordinary,
+            NonOdrUseReason::NOUR_None);
+        auto Call = BuildCallToMemberFunction(nullptr, Member, SourceLocation(),
+                                              {}, SourceLocation());
+        if (Call.isUsable()) {
+          MarkMemberReferenced(Member);
+          return Call.get();
+        }
+      }
+
+      Diag(BaseExpr->getExprLoc(), diag::err_extension_member_access);
+      return ExprError();
+    }
+  }
 
   if (FieldDecl *FD = dyn_cast<FieldDecl>(MemberDecl))
     return BuildFieldReferenceExpr(BaseExpr, IsArrow, OpLoc, SS, FD, FoundDecl,

@@ -28,6 +28,7 @@ public:
   Sema &S;
 
 protected:
+  bool ParsingExtendsKW = false;
   bool HandlingHookArgs = false;
   bool HandlingTilde = false;
 
@@ -51,15 +52,17 @@ public:
   DeclarationNameInfo BuildDNI(const IdentifierInfo *II, SourceLocation Loc);
 
   bool InjectSuperKW(CXXRecordDecl *E, TypeSourceInfo *B);
+  bool IsInHookScope();
 
   ExprResult LookupHookMemberBase(CXXRecordDecl *Base,
                                   const DeclarationNameInfo &DNI);
   ExprResult LookupHookDtorBase(CXXRecordDecl *Base);
 
   CXXMethodDecl *LookupBuiltinSelf(CXXRecordDecl *E, SourceLocation Loc,
-                                   bool Mutable);
+                                   bool Mutable, bool HookScope);
   CXXMethodDecl *LookupBuiltinSuper(CXXRecordDecl *E, SourceLocation Loc,
-                                    bool Mutable);
+                                    bool Mutable, bool HookScope);
+  CXXMethodDecl *LookupBuiltinDtorHook(CXXRecordDecl *MD);
 
   HookBaseKind GetHookBaseKind(Expr *BaseExpr);
   FunctionDecl *HandleSimpleBase(FunctionDecl *H, Expr *BaseExpr);
@@ -77,6 +80,7 @@ void handleLinkNameAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleDynamicLinkageAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleHookAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleRecordExtensionAttr(Sema &S, Decl *D, const ParsedAttr &AL);
+void handleNoDeallocatorAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 } // namespace clang
 
 #endif // LLVM_CLANG_SEMA_ML_H

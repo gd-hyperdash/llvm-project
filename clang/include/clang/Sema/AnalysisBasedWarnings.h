@@ -18,6 +18,7 @@
 
 namespace clang {
 
+class CXXRecordDecl;
 class Decl;
 class FunctionDecl;
 class QualType;
@@ -94,6 +95,8 @@ public:
 
   void IssueWarnings(Policy P, FunctionScopeInfo *fscope,
                      const Decl *D, QualType BlockType);
+
+  void TryExtensionDtorHook(const CXXRecordDecl* E);
 
   Policy getDefaultPolicy() { return DefaultPolicy; }
 

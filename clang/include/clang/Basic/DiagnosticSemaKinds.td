@@ -11671,4 +11671,8 @@ def err_extension_member_access : Error<
   "could not access member">;
 def err_extension_failed : Error<
   "could not instantiate extension">;
+def warn_extension_dtor_hook : Warning<
+  "could not hook base destructor, this will cause a memory leak">;
+def note_extension_deallocator_workaround : Note<
+  "see here for more information: https://hyperdash.ml/docs/data_extension#deallocator">;
 } // end of sema component.
