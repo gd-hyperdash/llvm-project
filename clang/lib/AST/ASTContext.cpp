@@ -11473,6 +11473,9 @@ bool ASTContext::DeclMustBeEmitted(const Decl *D) {
     // We never need to emit an uninstantiated function template.
     if (FD->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate)
       return false;
+    // We always emit hooks with a body.
+    if (FD->hasAttr<HookAttr>() && FD->hasBody())
+      return true;
   } else if (isa<PragmaCommentDecl>(D))
     return true;
   else if (isa<PragmaDetectMismatchDecl>(D))

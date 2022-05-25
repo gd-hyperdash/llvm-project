@@ -1093,38 +1093,6 @@ Sema::BuildMemberReferenceExpr(Expr *BaseExpr, QualType BaseExprType,
   if (DiagnoseUseOfDecl(MemberDecl, MemberLoc))
     return ExprError();
 
-  // Handle super keyword for extensions.
-  if (MemberDecl->getIdentifier() == &PP.getIdentifierTable().get("super")) {
-    // Is this an extension?
-    auto ThisRecord = BaseType->getAsCXXRecordDecl();
-    assert(ThisRecord && "No record?");
-
-    if (ThisRecord->hasAttr<RecordExtensionAttr>()) {
-      auto Super = ML.LookupBuiltinSuper(
-          const_cast<CXXRecordDecl *>(ThisRecord), BaseExpr->getExprLoc(),
-          !BaseType.isConstQualified(), ML.IsInHookScope());
-
-      if (Super) {
-        auto AP = DeclAccessPair::make(Super, AccessSpecifier::AS_public);
-        auto Member = MemberExpr::Create(
-            Context, BaseExpr, IsArrow, BaseExpr->getExprLoc(),
-            NestedNameSpecifierLoc(), SourceLocation(), Super, AP,
-            Super->getNameInfo(), nullptr, Context.BoundMemberTy,
-            ExprValueKind::VK_PRValue, ExprObjectKind::OK_Ordinary,
-            NonOdrUseReason::NOUR_None);
-        auto Call = BuildCallToMemberFunction(nullptr, Member, SourceLocation(),
-                                              {}, SourceLocation());
-        if (Call.isUsable()) {
-          MarkMemberReferenced(Member);
-          return Call.get();
-        }
-      }
-
-      Diag(BaseExpr->getExprLoc(), diag::err_extension_member_access);
-      return ExprError();
-    }
-  }
-
   if (FieldDecl *FD = dyn_cast<FieldDecl>(MemberDecl))
     return BuildFieldReferenceExpr(BaseExpr, IsArrow, OpLoc, SS, FD, FoundDecl,
                                    MemberNameInfo);

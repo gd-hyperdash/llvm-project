@@ -9041,10 +9041,6 @@ static void ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D,
     break;
 
     // ML attributes.
-  case ParsedAttr::AT_LinkName:
-    handleLinkNameAttr(S, D, AL);
-    break;
-
   case ParsedAttr::AT_DynamicLinkage:
     handleDynamicLinkageAttr(S, D, AL);
     break;

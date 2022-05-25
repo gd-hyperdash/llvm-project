@@ -3041,6 +3041,16 @@ ConstantAddress CodeGenModule::GetWeakRefReference(const ValueDecl *VD) {
   return ConstantAddress(Aliasee, DeclTy, Alignment);
 }
 
+static llvm::Constant *GetAddrOfHookBase(CodeGenModule &CGM, GlobalDecl GD) {
+  if (isa<CXXDestructorDecl>(GD.getDecl())) {
+    return CGM.getAddrOfCXXStructor(GD);
+  }
+
+  auto &FI = CGM.getTypes().arrangeGlobalDeclaration(GD);
+  auto Ty = CGM.getTypes().GetFunctionType(FI);
+  return CGM.GetAddrOfFunction(GD, Ty);
+}
+
 void CodeGenModule::EmitGlobal(GlobalDecl GD) {
   const auto *Global = cast<ValueDecl>(GD.getDecl());
 
@@ -3842,6 +3852,25 @@ llvm::Constant *CodeGenModule::GetOrCreateLLVMFunction(
   llvm::Function *F =
       llvm::Function::Create(FTy, llvm::Function::ExternalLinkage,
                              Entry ? StringRef() : MangledName, &getModule());
+
+  if (auto FD = cast_or_null<FunctionDecl>(D)) {
+    // Handle hook.
+    if (auto Attr = FD->getAttr<HookAttr>()) {
+      auto Base = Attr->getBase();
+      assert(Base && "No base?");
+      auto BaseAddr = GetAddrOfHookBase(*this, Base);
+      assert(BaseAddr && "No base address?");
+      auto Node = llvm::MDNode::get(VMContext,
+                                    {llvm::ConstantAsMetadata::get(BaseAddr)});
+      F->setMetadata(ml::MD_HOOK, Node);
+    }
+
+    // Handle hook base.
+    if (auto Attr = FD->getAttr<HookBaseAttr>()) {
+      auto Node = llvm::MDNode::get(VMContext, {});
+      F->setMetadata(ml::MD_HOOKBASE, Node);
+    }
+  }
 
   // If we already created a function with the same mangled name (but different
   // type) before, take its name and add it to the list of functions to be

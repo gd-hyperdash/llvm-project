@@ -39,6 +39,12 @@
 #include <type_traits>
 #include <utility>
 
+namespace ml {
+constexpr char MD_DYNAMIC[] = "ml.dynamic";
+constexpr char MD_HOOK[] = "ml.hook";
+constexpr char MD_HOOKBASE[] = "ml.hookbase";
+} // namespace ml
+
 namespace llvm {
 
 class Module;

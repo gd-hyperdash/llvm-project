@@ -4001,23 +4001,22 @@ def NoRandomizeLayout : InheritableAttr {
 
 def : MutualExclusions<[RandomizeLayout, NoRandomizeLayout]>;
 
-def LinkName : InheritableAttr {
-  let Spellings = [GNU<"link_name">, Declspec<"link_name">,
-                  CXX11<"", "link_name", 201703>, C2x<"", "link_name", 201904>];
-  let Args = [StringArgument<"Symbol">];
-  let Subjects = SubjectList<[Function], ErrorDiag>;
-  let Documentation = [Undocumented];
-}
-
 def DynamicLinkage : InheritableAttr {
-  let Spellings = [Keyword<"dynamic">];
-  let Subjects = SubjectList<[Function, CXXRecord], ErrorDiag>;
+  let Spellings = [CXX11<"", "dynamic", 201703>, C2x<"", "dynamic", 201904>];
+  let Args = [StringArgument<"ID", 1>];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
   let Documentation = [Undocumented];
 }
 
 def Hook : InheritableAttr {
   let Spellings = [CXX11<"", "hook", 201703>, C2x<"", "hook", 201904>];
-  let Args = [DeclArgument<Function, "Base">, IntArgument<"Flags", 1>];
+  let Args = [DeclArgument<Function, "Base", 1>, VariadicUnsignedArgument<"Flags">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def HookBase : InheritableAttr {
+  let Spellings = [Keyword<"hookbase">];
   let Subjects = SubjectList<[Function], ErrorDiag>;
   let Documentation = [Undocumented];
 }

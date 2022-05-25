@@ -2221,13 +2221,7 @@ void sema::AnalysisBasedWarnings::TryExtensionDtorHook(const CXXRecordDecl *E) {
     if (auto Dtor = Base->getDestructor()) {
       auto Hook = S.ML.LookupBuiltinDtorHook(MD);
       if (Hook) {
-        // Construct fake attribute.
-        AttributeFactory AF;
-        ParsedAttributes PA(AF);
-        PA.addNew(&S.PP.getIdentifierTable().get("hook"), SourceRange(),
-                  nullptr, SourceLocation(), nullptr, 0u,
-                  AttributeCommonInfo::AS_Keyword, SourceLocation());
-        Hook->addAttr(::new (S.Context) HookAttr(S.Context, PA.back(), Dtor));
+        S.ML.AddSillyAttr<HookAttr>(Hook, Dtor, nullptr, 0);
         DtorHooked = true;
       }
     }

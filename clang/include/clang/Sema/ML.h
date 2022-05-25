@@ -32,22 +32,28 @@ protected:
   bool HandlingHookArgs = false;
   bool HandlingTilde = false;
 
-  /// Cache for "link_name", used to prevent defining the
-  /// same symbol more than once.
-  llvm::SetVector<StringRef> LinkNameCache;
-
   SemaML(Sema &SemaRef) : S(SemaRef) {}
+
+  ASTContext &GetContext();
+  IdentifierInfo *GetIdentifier(StringRef Name);
 
   ExprResult LookupHookBaseImpl(CXXRecordDecl *Base, LookupResult &R);
   CXXMethodDecl *LookupBuiltinImpl(CXXRecordDecl *E, const IdentifierInfo *II,
                                    SourceLocation Loc);
 
 public:
+  template <typename Attr, typename... Args>
+  void AddSillyAttr(Decl *D, Args... args) {
+    AttributeFactory AF;
+    ParsedAttributes PA(AF);
+    auto &Context = GetContext();
+    PA.addNew(GetIdentifier("silly"), SourceRange(), nullptr, SourceLocation(),
+              nullptr, 0u, AttributeCommonInfo::AS_Keyword, SourceLocation());
+    D->addAttr(::new (Context) Attr(Context, PA.back(), args...));
+  }
+
   bool IsMLNamespace(const DeclContext *DC);
   bool IsInMLNamespace(const Decl *D);
-
-  void CacheLinkName(StringRef S) { LinkNameCache.insert(S); }
-  bool HasLinkNameCached(StringRef S) { return LinkNameCache.contains(S); }
 
   DeclarationNameInfo BuildDNI(const IdentifierInfo *II, SourceLocation Loc);
 
@@ -59,9 +65,7 @@ public:
   ExprResult LookupHookDtorBase(CXXRecordDecl *Base);
 
   CXXMethodDecl *LookupBuiltinSelf(CXXRecordDecl *E, SourceLocation Loc,
-                                   bool Mutable, bool HookScope);
-  CXXMethodDecl *LookupBuiltinSuper(CXXRecordDecl *E, SourceLocation Loc,
-                                    bool Mutable, bool HookScope);
+                                   bool Mutable);
   CXXMethodDecl *LookupBuiltinDtorHook(CXXRecordDecl *MD);
 
   HookBaseKind GetHookBaseKind(Expr *BaseExpr);
@@ -71,12 +75,12 @@ public:
   FunctionDecl *ValidateHookBase(FunctionDecl *H, FunctionDecl *B);
 
   FunctionDecl *FetchBaseOfHook(FunctionDecl *H, Expr *BaseExpr);
+  FunctionDecl *LookupBaseOfHook(FunctionDecl *H);
   TypeSourceInfo *AttachBaseToExtension(CXXRecordDecl *E, TypeSourceInfo *B);
 };
 
 /// Attribute handlers.
 
-void handleLinkNameAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleDynamicLinkageAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleHookAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleRecordExtensionAttr(Sema &S, Decl *D, const ParsedAttr &AL);

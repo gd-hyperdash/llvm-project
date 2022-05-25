@@ -559,7 +559,7 @@ public:
   // Return true if this value is only transitively referenced by metadata.
   bool isTransitiveUsedByMetadataOnly() const;
 
-protected:
+public:
   /// Get the current metadata attachments for the given kind, if any.
   ///
   /// These functions require that the value have at most a single attachment

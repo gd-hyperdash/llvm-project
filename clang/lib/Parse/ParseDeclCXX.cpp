@@ -2108,7 +2108,7 @@ void Parser::ParseClassSpecifier(tok::TokenKind TagTokKind,
   if (Result)
     Diag(StartLoc, DiagID) << PrevSpec;
 
-  // If this turns out to be an extension, attempt to hook the dtor.
+  // If this turns out to be an extension, attempt to hook the destructor.
   if (DeclSpec::isDeclRep(DS.getTypeSpecType())) {
     auto E = dyn_cast<CXXRecordDecl>(DS.getRepAsDecl());
     if (E && E->hasAttr<RecordExtensionAttr>()) {

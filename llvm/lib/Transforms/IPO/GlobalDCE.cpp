@@ -402,9 +402,11 @@ PreservedAnalyses GlobalDCEPass::run(Module &M, ModuleAnalysisManager &MAM) {
   // Now that all interferences have been dropped, delete the actual objects
   // themselves.
   auto EraseUnusedGlobalValue = [&](GlobalValue *GV) {
-    GV->removeDeadConstantUsers();
-    GV->eraseFromParent();
-    Changed = true;
+    if (!GV->hasMetadata(ml::MD_HOOKBASE)) {
+      GV->removeDeadConstantUsers();
+      GV->eraseFromParent();
+      Changed = true;
+    }
   };
 
   NumFunctions += DeadFunctions.size();

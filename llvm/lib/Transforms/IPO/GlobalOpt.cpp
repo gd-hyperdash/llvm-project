@@ -1300,6 +1300,10 @@ static bool deleteIfDead(
     Dead = (F->isDeclaration() && F->use_empty()) || F->isDefTriviallyDead();
   else
     Dead = GV.use_empty();
+
+  if (GV.hasMetadata(ml::MD_HOOKBASE))
+    Dead = false;
+
   if (!Dead)
     return false;
 

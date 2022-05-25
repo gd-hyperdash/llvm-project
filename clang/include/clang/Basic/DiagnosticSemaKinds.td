@@ -11641,6 +11641,8 @@ def err_hook_already_marked : Error<
   "function already marked as hook">;
 def err_hook_main : Error<
   "program entrypoint cannot be marked as hook">;
+def err_hook_flag : Error<
+  "invalid hook flag">;
 def err_hook_argument_not_valid : Error<
   "could not find a valid base for this hook">;
 def err_hook_type : Error<
@@ -11651,14 +11653,14 @@ def err_hook_variadic : Error<
   "incorrect variadic declaration">;
 def err_hook_noexcept : Error<
   "incorrect noexcept declaration">;
-def err_hook_cc : Error<
-  "incorrect calling convention">;
 def err_hook_member_base : Error<
   "incorrect base class, expected '%0'">;
 def err_hook_argument_is_hook : Error<
   "base function cannot be a hook">;
 def err_hook_argument_is_dependant : Error<
   "base function type cannot be dependant">;
+def err_hook_virtual : Error<
+  "hooks cannot be virtual">;
 def err_hook_call : Error<
   "hooks cannot be called directly">;
 
@@ -11667,6 +11669,8 @@ def err_extension_initialization : Error<
   "extensions cannot be constructed directly">;
 def err_extension_argument_is_dependant : Error<
   "extension base type cannot be dependant">;
+def err_extension_extbase : Error<
+  "base class cannot be an extension">;
 def err_extension_member_access : Error<
   "could not access member">;
 def err_extension_failed : Error<

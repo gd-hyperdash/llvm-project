@@ -1397,10 +1397,10 @@ Expr *Sema::BuildCXXThisExpr(SourceLocation Loc, QualType Type,
   auto ThisRecord = ThisTy->getAsCXXRecordDecl();
   assert(ThisRecord && "No record?");
 
-  if (ThisRecord->hasAttr<RecordExtensionAttr>()) {
-    auto Self = ML.LookupBuiltinSelf(
-        const_cast<CXXRecordDecl *>(ThisRecord), This->getExprLoc(),
-        !ThisTy.isConstQualified(), ML.IsInHookScope());
+  if (ThisRecord->hasAttr<RecordExtensionAttr>() && ML.IsInHookScope()) {
+    auto Self =
+        ML.LookupBuiltinSelf(const_cast<CXXRecordDecl *>(ThisRecord),
+                             This->getExprLoc(), !ThisTy.isConstQualified());
 
     if (Self) {
       auto AP = DeclAccessPair::make(Self, AccessSpecifier::AS_public);
